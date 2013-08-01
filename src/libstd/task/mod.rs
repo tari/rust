@@ -42,7 +42,7 @@ use cmp::Eq;
 use comm::{stream, Chan, GenericChan, GenericPort, Port};
 use result::Result;
 use result;
-use rt::{context, OldTaskContext, TaskContext};
+use rt::{context, TaskContext};
 use rt::local::Local;
 use unstable::finally::Finally;
 use util;
@@ -54,7 +54,6 @@ use util;
 #[cfg(test)] use task;
 
 mod local_data_priv;
-pub mod rt;
 pub mod spawn;
 
 /**
@@ -541,28 +540,14 @@ pub fn with_task_name<U>(blk: &fn(Option<&str>) -> U) -> U {
 pub fn yield() {
     //! Yield control to the task scheduler
 
-    use rt::{context, OldTaskContext};
     use rt::local::Local;
     use rt::sched::Scheduler;
 
-    unsafe {
-        match context() {
-            OldTaskContext => {
-                let task_ = rt::rust_get_task();
-                let killed = rt::rust_task_yield(task_);
-                if killed && !failing() {
-                    fail!("killed");
-                }
-            }
-            _ => {
-                // XXX: What does yield really mean in newsched?
-                // FIXME(#7544): Optimize this, since we know we won't block.
-                let sched = Local::take::<Scheduler>();
-                do sched.deschedule_running_task_and_then |sched, task| {
-                    sched.enqueue_blocked_task(task);
-                }
-            }
-        }
+    // XXX: What does yield really mean in newsched?
+    // FIXME(#7544): Optimize this, since we know we won't block.
+    let sched = Local::take::<Scheduler>();
+    do sched.deschedule_running_task_and_then |sched, task| {
+        sched.enqueue_blocked_task(task);
     }
 }
 
@@ -571,17 +556,8 @@ pub fn failing() -> bool {
 
     use rt::task::Task;
 
-    match context() {
-        OldTaskContext => {
-            unsafe {
-                rt::rust_task_is_unwinding(rt::rust_get_task())
-            }
-        }
-        _ => {
-            do Local::borrow::<Task, bool> |local| {
-                local.unwinder.unwinding
-            }
-        }
+    do Local::borrow::<Task, bool> |local| {
+        local.unwinder.unwinding
     }
 }
 
@@ -605,15 +581,6 @@ pub fn unkillable<U>(f: &fn() -> U) -> U {
 
     unsafe {
         match context() {
-            OldTaskContext => {
-                let t = rt::rust_get_task();
-                do (|| {
-                    rt::rust_task_inhibit_kill(t);
-                    f()
-                }).finally {
-                    rt::rust_task_allow_kill(t);
-                }
-            }
             TaskContext => {
                 // The inhibits/allows might fail and need to borrow the task.
                 let t = Local::unsafe_borrow::<Task>();
@@ -636,15 +603,6 @@ pub unsafe fn rekillable<U>(f: &fn() -> U) -> U {
     use rt::task::Task;
 
     match context() {
-        OldTaskContext => {
-            let t = rt::rust_get_task();
-            do (|| {
-                rt::rust_task_allow_kill(t);
-                f()
-            }).finally {
-                rt::rust_task_inhibit_kill(t);
-            }
-        }
         TaskContext => {
             let t = Local::unsafe_borrow::<Task>();
             do (|| {
@@ -1033,14 +991,8 @@ fn test_try_fail() {
 
 #[cfg(test)]
 fn get_sched_id() -> int {
-    if context() == OldTaskContext {
-        unsafe {
-            rt::rust_get_sched_id() as int
-        }
-    } else {
-        do Local::borrow::<::rt::sched::Scheduler, int> |sched| {
-            sched.sched_id() as int
-        }
+    do Local::borrow::<::rt::sched::Scheduler, int> |sched| {
+        sched.sched_id() as int
     }
 }
 

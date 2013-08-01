@@ -67,7 +67,6 @@ use iter::Times;
 use iterator::{Iterator, IteratorUtil};
 use option::{Some, None};
 use ptr::RawPtr;
-use rt::local::Local;
 use rt::sched::{Scheduler, Shutdown};
 use rt::sleeper_list::SleeperList;
 use rt::task::{Task, SchedTask, GreenTask, Sched};
@@ -121,7 +120,7 @@ mod context;
 /// Bindings to system threading libraries.
 mod thread;
 
-/// The runtime configuration, read from environment variables
+/// The runtime configuration, read from environment variables.
 pub mod env;
 
 /// The local, managed heap
@@ -401,22 +400,15 @@ pub enum RuntimeContext {
     SchedulerContext,
     // Full task services, e.g. local heap, unwinding
     TaskContext,
-    // Running in an old-style task
-    OldTaskContext
 }
 
 /// Determine the current RuntimeContext
 pub fn context() -> RuntimeContext {
 
-    use task::rt::rust_task;
+    use self::local::Local;
+    use self::task::Task;
 
-    if unsafe { rust_try_get_task().is_not_null() } {
-        return OldTaskContext;
-    } else if Local::exists::<Task>() {
-        // In this case we know it is a new runtime context, but we
-        // need to check which one. Going to try borrowing task to
-        // check. Task should always be in TLS, so hopefully this
-        // doesn't conflict with other ops that borrow.
+    if Local::exists::<Task>() {
         return do Local::borrow::<Task,RuntimeContext> |task| {
             match task.task_type {
                 SchedTask => SchedulerContext,
@@ -425,10 +417,5 @@ pub fn context() -> RuntimeContext {
         };
     } else {
         return GlobalContext;
-    }
-
-    extern {
-        #[rust_stack]
-        pub fn rust_try_get_task() -> *rust_task;
     }
 }
