@@ -133,6 +133,8 @@ pub fn from_fn_attrs(ccx: &CrateContext, attrs: &[ast::Attribute], llfn: ValueRe
             }
         } else if attr.check_name("allocator") {
             llvm::Attribute::NoAlias.apply_llfn(llvm::ReturnIndex as c_uint, llfn);
+        } else if attr.check_name("naked") {
+            llvm::SetFunctionAttribute(llfn, llvm::NakedAttribute);
         }
     }
 }

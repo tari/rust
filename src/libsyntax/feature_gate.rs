@@ -158,6 +158,9 @@ const KNOWN_FEATURES: &'static [(&'static str, &'static str, Status)] = &[
 
     // Allows using #[prelude_import] on glob `use` items.
     ("prelude_import", "1.2.0", Active),
+
+    // Allow naked functions
+    ("naked_fns", "1.3.0", Active),
 ];
 // (changing above list without updating src/doc/reference.md makes @cmr sad)
 
@@ -258,6 +261,7 @@ pub const KNOWN_ATTRIBUTES: &'static [(&'static str, AttributeType)] = &[
     ("link", Whitelisted),
     ("link_name", Whitelisted),
     ("link_section", Whitelisted),
+    ("naked", Gated("naked_fns", "`#[naked]` is an experimental feature")),
     ("no_builtins", Whitelisted),
     ("no_mangle", Whitelisted),
     ("no_stack_check", Whitelisted),
