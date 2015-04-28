@@ -1881,6 +1881,9 @@ type int8_t = i8;
 - `should_panic` - indicates that this test function should panic, inverting the success condition.
 - `cold` - The function is unlikely to be executed, so optimize it (and calls
   to it) differently.
+- `naked` - generate no prologue or epilogue for the function, the precise
+  effect of which is target-dependent. In general, writing anything but inline
+  assembly in a naked function is an error.
 
 ### Static-only attributes
 
