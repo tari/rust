@@ -10,5 +10,5 @@ test = false
 
 [dependencies]
 alloc = { path = "../liballoc" }
-core = { path = "../libcore" }
+#core = { path = "../libcore" }
 rustc_unicode = { path = "../librustc_unicode" }
