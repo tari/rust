@@ -116,15 +116,15 @@
 //! source-level module, functions from the same module will be available for
 //! inlining, even when they are not marked #[inline].
 
-use collector::{InliningMap, TransItem};
-use context::CrateContext;
+use collector::InliningMap;
+use llvm;
 use monomorphize;
 use rustc::hir::def_id::DefId;
 use rustc::hir::map::DefPathData;
 use rustc::ty::TyCtxt;
 use rustc::ty::item_path::characteristic_def_id_of_type;
-use llvm;
 use syntax::parse::token::{self, InternedString};
+use trans_item::TransItem;
 use util::nodemap::{FnvHashMap, FnvHashSet};
 
 pub struct CodegenUnit<'tcx> {
@@ -132,35 +132,54 @@ pub struct CodegenUnit<'tcx> {
     pub items: FnvHashMap<TransItem<'tcx>, llvm::Linkage>,
 }
 
+pub enum PartitioningStrategy {
+    /// Generate one codegen unit per source-level module.
+    PerModule,
+
+    /// Partition the whole crate into a fixed number of codegen units.
+    FixedUnitCount(usize)
+}
+
 // Anything we can't find a proper codegen unit for goes into this.
 const FALLBACK_CODEGEN_UNIT: &'static str = "__rustc_fallback_codegen_unit";
 
-pub fn partition<'tcx, I>(tcx: &TyCtxt<'tcx>,
-                          trans_items: I,
-                          inlining_map: &InliningMap<'tcx>)
-                          -> Vec<CodegenUnit<'tcx>>
+pub fn partition<'a, 'tcx, I>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                              trans_items: I,
+                              strategy: PartitioningStrategy,
+                              inlining_map: &InliningMap<'tcx>)
+                              -> Vec<CodegenUnit<'tcx>>
     where I: Iterator<Item = TransItem<'tcx>>
 {
     // In the first step, we place all regular translation items into their
     // respective 'home' codegen unit. Regular translation items are all
     // functions and statics defined in the local crate.
-    let initial_partitioning = place_root_translation_items(tcx, trans_items);
+    let mut initial_partitioning = place_root_translation_items(tcx, trans_items);
+
+    // If the partitioning should produce a fixed count of codegen units, merge
+    // until that count is reached.
+    if let PartitioningStrategy::FixedUnitCount(count) = strategy {
+        merge_codegen_units(&mut initial_partitioning, count, &tcx.crate_name[..]);
+    }
 
     // In the next step, we use the inlining map to determine which addtional
     // translation items have to go into each codegen unit. These additional
     // translation items can be drop-glue, functions from external crates, and
     // local functions the definition of which is marked with #[inline].
-    place_inlined_translation_items(initial_partitioning, inlining_map)
+    let post_inlining = place_inlined_translation_items(initial_partitioning,
+                                                        inlining_map);
+    post_inlining.0
 }
 
-struct InitialPartitioning<'tcx> {
+struct PreInliningPartitioning<'tcx> {
     codegen_units: Vec<CodegenUnit<'tcx>>,
     roots: FnvHashSet<TransItem<'tcx>>,
 }
 
-fn place_root_translation_items<'tcx, I>(tcx: &TyCtxt<'tcx>,
-                                         trans_items: I)
-                                         -> InitialPartitioning<'tcx>
+struct PostInliningPartitioning<'tcx>(Vec<CodegenUnit<'tcx>>);
+
+fn place_root_translation_items<'a, 'tcx, I>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                                             trans_items: I)
+                                             -> PreInliningPartitioning<'tcx>
     where I: Iterator<Item = TransItem<'tcx>>
 {
     let mut roots = FnvHashSet();
@@ -209,7 +228,7 @@ fn place_root_translation_items<'tcx, I>(tcx: &TyCtxt<'tcx>,
         }
     }
 
-    InitialPartitioning {
+    PreInliningPartitioning {
         codegen_units: codegen_units.into_iter()
                                     .map(|(_, codegen_unit)| codegen_unit)
                                     .collect(),
@@ -217,10 +236,50 @@ fn place_root_translation_items<'tcx, I>(tcx: &TyCtxt<'tcx>,
     }
 }
 
-fn place_inlined_translation_items<'tcx>(initial_partitioning: InitialPartitioning<'tcx>,
+fn merge_codegen_units<'tcx>(initial_partitioning: &mut PreInliningPartitioning<'tcx>,
+                             target_cgu_count: usize,
+                             crate_name: &str) {
+    assert!(target_cgu_count >= 1);
+    let codegen_units = &mut initial_partitioning.codegen_units;
+
+    // Merge the two smallest codegen units until the target size is reached.
+    // Note that "size" is estimated here rather inaccurately as the number of
+    // translation items in a given unit. This could be improved on.
+    while codegen_units.len() > target_cgu_count {
+        // Sort small cgus to the back
+        codegen_units.as_mut_slice().sort_by_key(|cgu| -(cgu.items.len() as i64));
+        let smallest = codegen_units.pop().unwrap();
+        let second_smallest = codegen_units.last_mut().unwrap();
+
+        for (k, v) in smallest.items.into_iter() {
+            second_smallest.items.insert(k, v);
+        }
+    }
+
+    for (index, cgu) in codegen_units.iter_mut().enumerate() {
+        cgu.name = numbered_codegen_unit_name(crate_name, index);
+    }
+
+    // If the initial partitioning contained less than target_cgu_count to begin
+    // with, we won't have enough codegen units here, so add a empty units until
+    // we reach the target count
+    while codegen_units.len() < target_cgu_count {
+        let index = codegen_units.len();
+        codegen_units.push(CodegenUnit {
+            name: numbered_codegen_unit_name(crate_name, index),
+            items: FnvHashMap()
+        });
+    }
+
+    fn numbered_codegen_unit_name(crate_name: &str, index: usize) -> InternedString {
+        token::intern_and_get_ident(&format!("{}.{}", crate_name, index)[..])
+    }
+}
+
+fn place_inlined_translation_items<'tcx>(initial_partitioning: PreInliningPartitioning<'tcx>,
                                          inlining_map: &InliningMap<'tcx>)
-                                         -> Vec<CodegenUnit<'tcx>> {
-    let mut final_partitioning = Vec::new();
+                                         -> PostInliningPartitioning<'tcx> {
+    let mut new_partitioning = Vec::new();
 
     for codegen_unit in &initial_partitioning.codegen_units[..] {
         // Collect all items that need to be available in this codegen unit
@@ -229,7 +288,7 @@ fn place_inlined_translation_items<'tcx>(initial_partitioning: InitialPartitioni
             follow_inlining(*root, inlining_map, &mut reachable);
         }
 
-        let mut final_codegen_unit = CodegenUnit {
+        let mut new_codegen_unit = CodegenUnit {
             name: codegen_unit.name.clone(),
             items: FnvHashMap(),
         };
@@ -238,26 +297,28 @@ fn place_inlined_translation_items<'tcx>(initial_partitioning: InitialPartitioni
         for trans_item in reachable {
             if let Some(linkage) = codegen_unit.items.get(&trans_item) {
                 // This is a root, just copy it over
-                final_codegen_unit.items.insert(trans_item, *linkage);
+                new_codegen_unit.items.insert(trans_item, *linkage);
             } else {
                 if initial_partitioning.roots.contains(&trans_item) {
                     // This item will be instantiated in some other codegen unit,
                     // so we just add it here with AvailableExternallyLinkage
-                    final_codegen_unit.items.insert(trans_item, llvm::AvailableExternallyLinkage);
+                    new_codegen_unit.items.insert(trans_item,
+                                                  llvm::AvailableExternallyLinkage);
                 } else {
                     // We can't be sure if this will also be instantiated
                     // somewhere else, so we add an instance here with
                     // LinkOnceODRLinkage. That way the item can be discarded if
                     // it's not needed (inlined) after all.
-                    final_codegen_unit.items.insert(trans_item, llvm::LinkOnceODRLinkage);
+                    new_codegen_unit.items.insert(trans_item,
+                                                  llvm::LinkOnceODRLinkage);
                 }
             }
         }
 
-        final_partitioning.push(final_codegen_unit);
+        new_partitioning.push(new_codegen_unit);
     }
 
-    return final_partitioning;
+    return PostInliningPartitioning(new_partitioning);
 
     fn follow_inlining<'tcx>(trans_item: TransItem<'tcx>,
                              inlining_map: &InliningMap<'tcx>,
@@ -266,17 +327,15 @@ fn place_inlined_translation_items<'tcx>(initial_partitioning: InitialPartitioni
             return;
         }
 
-        if let Some(inlined_items) = inlining_map.get(&trans_item) {
-            for &inlined_item in inlined_items {
-                follow_inlining(inlined_item, inlining_map, visited);
-            }
-        }
+        inlining_map.with_inlining_candidates(trans_item, |target| {
+            follow_inlining(target, inlining_map, visited);
+        });
     }
 }
 
-fn characteristic_def_id_of_trans_item<'tcx>(tcx: &TyCtxt<'tcx>,
-                                             trans_item: TransItem<'tcx>)
-                                             -> Option<DefId> {
+fn characteristic_def_id_of_trans_item<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                                                 trans_item: TransItem<'tcx>)
+                                                 -> Option<DefId> {
     match trans_item {
         TransItem::Fn(instance) => {
             // If this is a method, we want to put it into the same module as
@@ -304,15 +363,15 @@ fn characteristic_def_id_of_trans_item<'tcx>(tcx: &TyCtxt<'tcx>,
 
             Some(instance.def)
         }
-        TransItem::DropGlue(t) => characteristic_def_id_of_type(t),
+        TransItem::DropGlue(dg) => characteristic_def_id_of_type(dg.ty()),
         TransItem::Static(node_id) => Some(tcx.map.local_def_id(node_id)),
     }
 }
 
-fn compute_codegen_unit_name<'tcx>(tcx: &TyCtxt<'tcx>,
-                                   def_id: DefId,
-                                   volatile: bool)
-                                   -> InternedString {
+fn compute_codegen_unit_name<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                                       def_id: DefId,
+                                       volatile: bool)
+                                       -> InternedString {
     // Unfortunately we cannot just use the `ty::item_path` infrastructure here
     // because we need paths to modules and the DefIds of those are not
     // available anymore for external items.
@@ -339,25 +398,4 @@ fn compute_codegen_unit_name<'tcx>(tcx: &TyCtxt<'tcx>,
     }
 
     return token::intern_and_get_ident(&mod_path[..]);
-}
-
-impl<'tcx> CodegenUnit<'tcx> {
-    pub fn _dump<'a>(&self, ccx: &CrateContext<'a, 'tcx>) {
-        println!("CodegenUnit {} (", self.name);
-
-        let mut items: Vec<_> = self.items
-                                    .iter()
-                                    .map(|(trans_item, inst)| {
-                                        format!("{} -- ({:?})", trans_item.to_string(ccx), inst)
-                                    })
-                                    .collect();
-
-        items.as_mut_slice().sort();
-
-        for s in items {
-            println!("  {}", s);
-        }
-
-        println!(")");
-    }
 }

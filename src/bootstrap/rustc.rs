@@ -44,26 +44,26 @@ fn main() {
     // have the standard library built yet and may not be able to produce an
     // executable. Otherwise we just use the standard compiler we're
     // bootstrapping with.
-    let rustc = if target.is_none() {
-        env::var_os("RUSTC_SNAPSHOT").unwrap()
+    let (rustc, libdir) = if target.is_none() {
+        ("RUSTC_SNAPSHOT", "RUSTC_SNAPSHOT_LIBDIR")
     } else {
-        env::var_os("RUSTC_REAL").unwrap()
+        ("RUSTC_REAL", "RUSTC_LIBDIR")
     };
+    let stage = env::var("RUSTC_STAGE").unwrap();
+
+    let rustc = env::var_os(rustc).unwrap();
+    let libdir = env::var_os(libdir).unwrap();
+    let mut dylib_path = bootstrap::dylib_path();
+    dylib_path.insert(0, PathBuf::from(libdir));
 
     let mut cmd = Command::new(rustc);
     cmd.args(&args)
-       .arg("--cfg").arg(format!("stage{}", env::var("RUSTC_STAGE").unwrap()));
+       .arg("--cfg").arg(format!("stage{}", stage))
+       .env(bootstrap::dylib_path_var(), env::join_paths(&dylib_path).unwrap());
 
-    if target.is_none() {
-        // Build scripts are always built with the snapshot compiler, so we need
-        // to be sure to set up the right path information for the OS dynamic
-        // linker to find the libraries in question.
-        if let Some(p) = env::var_os("RUSTC_SNAPSHOT_LIBDIR") {
-            let mut path = bootstrap::dylib_path();
-            path.insert(0, PathBuf::from(p));
-            cmd.env(bootstrap::dylib_path_var(), env::join_paths(path).unwrap());
-        }
-    } else {
+    if let Some(target) = target {
+        // The stage0 compiler has a special sysroot distinct from what we
+        // actually downloaded, so we just always pass the `--sysroot` option.
         cmd.arg("--sysroot").arg(env::var_os("RUSTC_SYSROOT").unwrap());
 
         // When we build Rust dylibs they're all intended for intermediate
@@ -71,20 +71,39 @@ fn main() {
         // linking all deps statically into the dylib.
         cmd.arg("-Cprefer-dynamic");
 
+        // Help the libc crate compile by assisting it in finding the MUSL
+        // native libraries.
         if let Some(s) = env::var_os("MUSL_ROOT") {
             let mut root = OsString::from("native=");
             root.push(&s);
             root.push("/lib");
             cmd.arg("-L").arg(&root);
         }
+
+        // Pass down extra flags, commonly used to configure `-Clinker` when
+        // cross compiling.
         if let Ok(s) = env::var("RUSTC_FLAGS") {
             cmd.args(&s.split(" ").filter(|s| !s.is_empty()).collect::<Vec<_>>());
         }
-    }
 
-    // Set various options from config.toml to configure how we're building
-    // code.
-    if let Some(target) = target {
+        // If we're compiling specifically the `panic_abort` crate then we pass
+        // the `-C panic=abort` option. Note that we do not do this for any
+        // other crate intentionally as this is the only crate for now that we
+        // ship with panic=abort.
+        //
+        // This... is a bit of a hack how we detect this. Ideally this
+        // information should be encoded in the crate I guess? Would likely
+        // require an RFC amendment to RFC 1513, however.
+        let is_panic_abort = args.windows(2).any(|a| {
+            &*a[0] == "--crate-name" && &*a[1] == "panic_abort"
+        });
+        // FIXME(stage0): remove this `stage != "0"` condition
+        if is_panic_abort && stage != "0" {
+            cmd.arg("-C").arg("panic=abort");
+        }
+
+        // Set various options from config.toml to configure how we're building
+        // code.
         if env::var("RUSTC_DEBUGINFO") == Ok("true".to_string()) {
             cmd.arg("-g");
         }

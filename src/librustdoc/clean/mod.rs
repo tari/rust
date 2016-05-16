@@ -31,14 +31,15 @@ use syntax::attr;
 use syntax::attr::{AttributeMethods, AttrMetaMethods};
 use syntax::codemap;
 use syntax::codemap::{DUMMY_SP, Pos, Spanned};
-use syntax::parse::token::{self, InternedString, special_idents};
+use syntax::parse::token::{self, InternedString, keywords};
 use syntax::ptr::P;
 
 use rustc_trans::back::link;
-use rustc::middle::cstore::{self, CrateStore};
+use rustc::middle::cstore;
 use rustc::middle::privacy::AccessLevels;
 use rustc::hir::def::Def;
-use rustc::hir::def_id::{DefId, DefIndex};
+use rustc::hir::def_id::{DefId, DefIndex, CRATE_DEF_INDEX};
+use rustc::hir::print as pprust;
 use rustc::ty::subst::{self, ParamSpace, VecPerParamSpace};
 use rustc::ty;
 use rustc::middle::stability;
@@ -63,11 +64,11 @@ mod simplify;
 
 // extract the stability index for a node from tcx, if possible
 fn get_stability(cx: &DocContext, def_id: DefId) -> Option<Stability> {
-    cx.tcx_opt().and_then(|tcx| stability::lookup_stability(tcx, def_id)).clean(cx)
+    cx.tcx_opt().and_then(|tcx| tcx.lookup_stability(def_id)).clean(cx)
 }
 
 fn get_deprecation(cx: &DocContext, def_id: DefId) -> Option<Deprecation> {
-    cx.tcx_opt().and_then(|tcx| stability::lookup_deprecation(tcx, def_id)).clean(cx)
+    cx.tcx_opt().and_then(|tcx| tcx.lookup_deprecation(def_id)).clean(cx)
 }
 
 pub trait Clean<T> {
@@ -730,7 +731,7 @@ impl<'tcx> Clean<TyParamBound> for ty::TraitRef<'tcx> {
         // collect any late bound regions
         let mut late_bounds = vec![];
         for &ty_s in self.substs.types.get_slice(ParamSpace::TypeSpace) {
-            if let ty::TyTuple(ref ts) = ty_s.sty {
+            if let ty::TyTuple(ts) = ty_s.sty {
                 for &ty_s in ts {
                     if let ty::TyRef(ref reg, _) = ty_s.sty {
                         if let &ty::Region::ReLateBound(_, _) = *reg {
@@ -865,6 +866,7 @@ impl<'a> Clean<WherePredicate> for ty::Predicate<'a> {
             Predicate::WellFormed(_) => panic!("not user writable"),
             Predicate::ObjectSafe(_) => panic!("not user writable"),
             Predicate::ClosureKind(..) => panic!("not user writable"),
+            Predicate::Rfc1592(..) => panic!("not user writable"),
         }
     }
 }
@@ -1023,7 +1025,6 @@ impl<'a, 'tcx> Clean<Generics> for (&'a ty::Generics<'tcx>,
 #[derive(Clone, RustcEncodable, RustcDecodable, Debug)]
 pub struct Method {
     pub generics: Generics,
-    pub self_: SelfTy,
     pub unsafety: hir::Unsafety,
     pub constness: hir::Constness,
     pub decl: FnDecl,
@@ -1032,14 +1033,9 @@ pub struct Method {
 
 impl Clean<Method> for hir::MethodSig {
     fn clean(&self, cx: &DocContext) -> Method {
-        let all_inputs = &self.decl.inputs;
-        let inputs = match self.explicit_self.node {
-            hir::SelfStatic => &**all_inputs,
-            _ => &all_inputs[1..]
-        };
         let decl = FnDecl {
             inputs: Arguments {
-                values: inputs.clean(cx),
+                values: self.decl.inputs.clean(cx),
             },
             output: self.decl.output.clean(cx),
             variadic: false,
@@ -1047,7 +1043,6 @@ impl Clean<Method> for hir::MethodSig {
         };
         Method {
             generics: self.generics.clean(cx),
-            self_: self.explicit_self.node.clean(cx),
             unsafety: self.unsafety,
             constness: self.constness,
             decl: decl,
@@ -1061,19 +1056,14 @@ pub struct TyMethod {
     pub unsafety: hir::Unsafety,
     pub decl: FnDecl,
     pub generics: Generics,
-    pub self_: SelfTy,
     pub abi: Abi,
 }
 
 impl Clean<TyMethod> for hir::MethodSig {
     fn clean(&self, cx: &DocContext) -> TyMethod {
-        let inputs = match self.explicit_self.node {
-            hir::SelfStatic => &*self.decl.inputs,
-            _ => &self.decl.inputs[1..]
-        };
         let decl = FnDecl {
             inputs: Arguments {
-                values: inputs.clean(cx),
+                values: self.decl.inputs.clean(cx),
             },
             output: self.decl.output.clean(cx),
             variadic: false,
@@ -1082,30 +1072,8 @@ impl Clean<TyMethod> for hir::MethodSig {
         TyMethod {
             unsafety: self.unsafety.clone(),
             decl: decl,
-            self_: self.explicit_self.node.clean(cx),
             generics: self.generics.clean(cx),
             abi: self.abi
-        }
-    }
-}
-
-#[derive(Clone, RustcEncodable, RustcDecodable, PartialEq, Debug)]
-pub enum SelfTy {
-    SelfStatic,
-    SelfValue,
-    SelfBorrowed(Option<Lifetime>, Mutability),
-    SelfExplicit(Type),
-}
-
-impl Clean<SelfTy> for hir::ExplicitSelf_ {
-    fn clean(&self, cx: &DocContext) -> SelfTy {
-        match *self {
-            hir::SelfStatic => SelfStatic,
-            hir::SelfValue(_) => SelfValue,
-            hir::SelfRegion(ref lt, ref mt, _) => {
-                SelfBorrowed(lt.clean(cx), mt.clean(cx))
-            }
-            hir::SelfExplicit(ref typ, _) => SelfExplicit(typ.clean(cx)),
         }
     }
 }
@@ -1148,6 +1116,12 @@ pub struct FnDecl {
     pub attrs: Vec<Attribute>,
 }
 
+impl FnDecl {
+    pub fn has_self(&self) -> bool {
+        return self.inputs.values.len() > 0 && self.inputs.values[0].name == "self";
+    }
+}
+
 #[derive(Clone, RustcEncodable, RustcDecodable, PartialEq, Debug)]
 pub struct Arguments {
     pub values: Vec<Argument>,
@@ -1183,9 +1157,6 @@ impl<'a, 'tcx> Clean<FnDecl> for (DefId, &'a ty::PolyFnSig<'tcx>) {
         } else {
             cx.tcx().sess.cstore.method_arg_names(did).into_iter()
         }.peekable();
-        if let Some("self") = names.peek().map(|s| &s[..]) {
-            let _ = names.next();
-        }
         FnDecl {
             output: Return(sig.0.output.clean(cx)),
             attrs: Vec::new(),
@@ -1208,6 +1179,29 @@ pub struct Argument {
     pub type_: Type,
     pub name: String,
     pub id: ast::NodeId,
+}
+
+#[derive(Clone, RustcEncodable, RustcDecodable, PartialEq, Debug)]
+pub enum SelfTy {
+    SelfValue,
+    SelfBorrowed(Option<Lifetime>, Mutability),
+    SelfExplicit(Type),
+}
+
+impl Argument {
+    pub fn to_self(&self) -> Option<SelfTy> {
+        if self.name == "self" {
+            match self.type_ {
+                Infer => Some(SelfValue),
+                BorrowedRef{ref lifetime, mutability, ref type_} if **type_ == Infer => {
+                    Some(SelfBorrowed(lifetime.clone(), mutability))
+                }
+                _ => Some(SelfExplicit(self.type_.clone()))
+            }
+        } else {
+            None
+        }
+    }
 }
 
 impl Clean<Argument> for hir::Arg {
@@ -1285,8 +1279,7 @@ impl Clean<Item> for hir::TraitItem {
         let inner = match self.node {
             hir::ConstTraitItem(ref ty, ref default) => {
                 AssociatedConstItem(ty.clean(cx),
-                                    default.as_ref().map(|expr|
-                                                         expr.span.to_src(cx)))
+                                    default.as_ref().map(|e| pprust::expr_to_string(&e)))
             }
             hir::MethodTraitItem(ref sig, Some(_)) => {
                 MethodItem(sig.clean(cx))
@@ -1316,7 +1309,7 @@ impl Clean<Item> for hir::ImplItem {
         let inner = match self.node {
             hir::ImplItemKind::Const(ref ty, ref expr) => {
                 AssociatedConstItem(ty.clean(cx),
-                                    Some(expr.span.to_src(cx)))
+                                    Some(pprust::expr_to_string(expr)))
             }
             hir::ImplItemKind::Method(ref sig, _) => {
                 MethodItem(sig.clean(cx))
@@ -1345,36 +1338,21 @@ impl Clean<Item> for hir::ImplItem {
 
 impl<'tcx> Clean<Item> for ty::Method<'tcx> {
     fn clean(&self, cx: &DocContext) -> Item {
-        let (self_, sig) = match self.explicit_self {
-            ty::ExplicitSelfCategory::Static => (hir::SelfStatic.clean(cx),
-                                                 self.fty.sig.clone()),
-            s => {
-                let sig = ty::Binder(ty::FnSig {
-                    inputs: self.fty.sig.0.inputs[1..].to_vec(),
-                    ..self.fty.sig.0.clone()
-                });
-                let s = match s {
-                    ty::ExplicitSelfCategory::ByValue => SelfValue,
-                    ty::ExplicitSelfCategory::ByReference(..) => {
-                        match self.fty.sig.0.inputs[0].sty {
-                            ty::TyRef(r, mt) => {
-                                SelfBorrowed(r.clean(cx), mt.mutbl.clean(cx))
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                    ty::ExplicitSelfCategory::ByBox => {
-                        SelfExplicit(self.fty.sig.0.inputs[0].clean(cx))
-                    }
-                    ty::ExplicitSelfCategory::Static => unreachable!(),
-                };
-                (s, sig)
-            }
-        };
-
         let generics = (&self.generics, &self.predicates,
                         subst::FnSpace).clean(cx);
-        let decl = (self.def_id, &sig).clean(cx);
+        let mut decl = (self.def_id, &self.fty.sig).clean(cx);
+        match self.explicit_self {
+            ty::ExplicitSelfCategory::ByValue => {
+                decl.inputs.values[0].type_ = Infer;
+            }
+            ty::ExplicitSelfCategory::ByReference(..) => {
+                match decl.inputs.values[0].type_ {
+                    BorrowedRef{ref mut type_, ..} => **type_ = Infer,
+                    _ => unreachable!(),
+                }
+            }
+            _ => {}
+        }
         let provided = match self.container {
             ty::ImplContainer(..) => false,
             ty::TraitContainer(did) => {
@@ -1387,7 +1365,6 @@ impl<'tcx> Clean<Item> for ty::Method<'tcx> {
             MethodItem(Method {
                 unsafety: self.fty.unsafety,
                 generics: generics,
-                self_: self_,
                 decl: decl,
                 abi: self.fty.abi,
 
@@ -1398,7 +1375,6 @@ impl<'tcx> Clean<Item> for ty::Method<'tcx> {
             TyMethodItem(TyMethod {
                 unsafety: self.fty.unsafety,
                 generics: generics,
-                self_: self_,
                 decl: decl,
                 abi: self.fty.abi,
             })
@@ -1533,10 +1509,10 @@ impl Type {
         }
     }
 
-    pub fn trait_name(&self) -> Option<String> {
+    pub fn is_generic(&self) -> bool {
         match *self {
-            ResolvedPath { ref path, .. } => Some(path.last_name()),
-            _ => None,
+            ResolvedPath { is_generic, .. } => is_generic,
+            _ => false,
         }
     }
 }
@@ -1635,8 +1611,8 @@ impl Clean<Type> for hir::Ty {
                 BorrowedRef {lifetime: l.clean(cx), mutability: m.mutbl.clean(cx),
                              type_: box m.ty.clean(cx)},
             TyVec(ref ty) => Vector(box ty.clean(cx)),
-            TyFixedLengthVec(ref ty, ref e) => FixedVector(box ty.clean(cx),
-                                                           e.span.to_src(cx)),
+            TyFixedLengthVec(ref ty, ref e) =>
+                FixedVector(box ty.clean(cx), pprust::expr_to_string(e)),
             TyTup(ref tys) => Tuple(tys.clean(cx)),
             TyPath(None, ref p) => {
                 resolve_type(cx, p.clean(cx), self.id)
@@ -1721,7 +1697,7 @@ impl<'tcx> Clean<Type> for ty::Ty<'tcx> {
                     where_predicates: Vec::new()
                 },
                 decl: (cx.map.local_def_id(0), &fty.sig).clean(cx),
-                abi: fty.abi.to_string(),
+                abi: fty.abi,
             }),
             ty::TyStruct(def, substs) |
             ty::TyEnum(def, substs) => {
@@ -2143,7 +2119,7 @@ pub struct BareFunctionDecl {
     pub unsafety: hir::Unsafety,
     pub generics: Generics,
     pub decl: FnDecl,
-    pub abi: String,
+    pub abi: Abi,
 }
 
 impl Clean<BareFunctionDecl> for hir::BareFnTy {
@@ -2156,7 +2132,7 @@ impl Clean<BareFunctionDecl> for hir::BareFnTy {
                 where_predicates: Vec::new()
             },
             decl: self.decl.clean(cx),
-            abi: self.abi.to_string(),
+            abi: self.abi,
         }
     }
 }
@@ -2185,7 +2161,7 @@ impl Clean<Item> for doctree::Static {
             inner: StaticItem(Static {
                 type_: self.type_.clean(cx),
                 mutability: self.mutability.clean(cx),
-                expr: self.expr.span.to_src(cx),
+                expr: pprust::expr_to_string(&self.expr),
             }),
         }
     }
@@ -2209,7 +2185,7 @@ impl Clean<Item> for doctree::Constant {
             deprecation: self.depr.clean(cx),
             inner: ConstantItem(Constant {
                 type_: self.type_.clean(cx),
-                expr: self.expr.span.to_src(cx),
+                expr: pprust::expr_to_string(&self.expr),
             }),
         }
     }
@@ -2388,7 +2364,7 @@ impl Clean<Item> for doctree::ExternCrate {
             name: None,
             attrs: self.attrs.clean(cx),
             source: self.whence.clean(cx),
-            def_id: cx.map.local_def_id(0),
+            def_id: DefId { krate: self.cnum, index: CRATE_DEF_INDEX },
             visibility: self.vis.clean(cx),
             stability: None,
             deprecation: None,
@@ -2666,7 +2642,7 @@ fn resolve_type(cx: &DocContext,
             hir::TyFloat(ast::FloatTy::F64) => return Primitive(F64),
         },
         Def::SelfTy(..) if path.segments.len() == 1 => {
-            return Generic(special_idents::type_self.name.to_string());
+            return Generic(keywords::SelfType.name().to_string());
         }
         Def::SelfTy(..) | Def::TyParam(..) => true,
         _ => false,
@@ -2688,7 +2664,7 @@ fn register_def(cx: &DocContext, def: Def) -> DefId {
         Def::Static(i, _) => (i, TypeStatic),
         Def::Variant(i, _) => (i, TypeEnum),
         Def::SelfTy(Some(def_id), _) => (def_id, TypeTrait),
-        Def::SelfTy(_, Some((impl_id, _))) => return cx.map.local_def_id(impl_id),
+        Def::SelfTy(_, Some(impl_id)) => return cx.map.local_def_id(impl_id),
         _ => return def.def_id()
     };
     if did.is_local() { return did }
@@ -2870,8 +2846,8 @@ impl<'tcx> Clean<Item> for ty::AssociatedType<'tcx> {
             inner: AssociatedTypeItem(bounds, self.ty.clean(cx)),
             visibility: self.vis.clean(cx),
             def_id: self.def_id,
-            stability: stability::lookup_stability(cx.tcx(), self.def_id).clean(cx),
-            deprecation: stability::lookup_deprecation(cx.tcx(), self.def_id).clean(cx),
+            stability: cx.tcx().lookup_stability(self.def_id).clean(cx),
+            deprecation: cx.tcx().lookup_deprecation(self.def_id).clean(cx),
         }
     }
 }

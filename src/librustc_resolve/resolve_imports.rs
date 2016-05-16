@@ -25,8 +25,7 @@ use rustc::lint;
 use rustc::hir::def::*;
 
 use syntax::ast::{NodeId, Name};
-use syntax::attr::AttrMetaMethods;
-use syntax::codemap::Span;
+use syntax::codemap::{Span, DUMMY_SP};
 use syntax::util::lev_distance::find_best_match_for_name;
 
 use std::cell::{Cell, RefCell};
@@ -76,7 +75,7 @@ impl<'a> ImportDirective<'a> {
                 directive: self,
                 privacy_error: privacy_error,
             },
-            span: Some(self.span),
+            span: self.span,
             vis: self.vis,
         }
     }
@@ -345,11 +344,11 @@ struct ImportResolvingError<'a> {
     help: String,
 }
 
-struct ImportResolver<'a, 'b: 'a, 'tcx: 'b> {
-    resolver: &'a mut Resolver<'b, 'tcx>,
+struct ImportResolver<'a, 'b: 'a> {
+    resolver: &'a mut Resolver<'b>,
 }
 
-impl<'a, 'b:'a, 'tcx:'b> ImportResolver<'a, 'b, 'tcx> {
+impl<'a, 'b:'a> ImportResolver<'a, 'b> {
     // Import resolution
     //
     // This is a fixed-point algorithm. We resolve imports until our efforts
@@ -412,7 +411,7 @@ impl<'a, 'b:'a, 'tcx:'b> ImportResolver<'a, 'b, 'tcx> {
         if let SingleImport { target, .. } = e.import_directive.subclass {
             let dummy_binding = self.resolver.arenas.alloc_name_binding(NameBinding {
                 kind: NameBindingKind::Def(Def::Err),
-                span: None,
+                span: DUMMY_SP,
                 vis: ty::Visibility::Public,
             });
             let dummy_binding = e.import_directive.import(dummy_binding, None);
@@ -552,9 +551,9 @@ impl<'a, 'b:'a, 'tcx:'b> ImportResolver<'a, 'b, 'tcx> {
             _ => (),
         }
 
-        let ast_map = self.resolver.ast_map;
         match (&value_result, &type_result) {
-            (&Success(binding), _) if !binding.pseudo_vis().is_at_least(directive.vis, ast_map) &&
+            (&Success(binding), _) if !binding.pseudo_vis()
+                                              .is_at_least(directive.vis, self.resolver) &&
                                       self.resolver.is_accessible(binding.vis) => {
                 let msg = format!("`{}` is private, and cannot be reexported", source);
                 let note_msg = format!("consider marking `{}` as `pub` in the imported module",
@@ -564,7 +563,8 @@ impl<'a, 'b:'a, 'tcx:'b> ImportResolver<'a, 'b, 'tcx> {
                     .emit();
             }
 
-            (_, &Success(binding)) if !binding.pseudo_vis().is_at_least(directive.vis, ast_map) &&
+            (_, &Success(binding)) if !binding.pseudo_vis()
+                                              .is_at_least(directive.vis, self.resolver) &&
                                       self.resolver.is_accessible(binding.vis) => {
                 if binding.is_extern_crate() {
                     let msg = format!("extern crate `{}` is private, and cannot be reexported \
@@ -608,7 +608,7 @@ impl<'a, 'b:'a, 'tcx:'b> ImportResolver<'a, 'b, 'tcx> {
             None => value_result.success().and_then(NameBinding::def).unwrap(),
         };
         let path_resolution = PathResolution { base_def: def, depth: 0 };
-        self.resolver.def_map.borrow_mut().insert(directive.id, path_resolution);
+        self.resolver.def_map.insert(directive.id, path_resolution);
 
         debug!("(resolving single import) successfully resolved import");
         return Success(());
@@ -653,11 +653,8 @@ impl<'a, 'b:'a, 'tcx:'b> ImportResolver<'a, 'b, 'tcx> {
 
         // Record the destination of this import
         if let Some(did) = target_module.def_id() {
-            self.resolver.def_map.borrow_mut().insert(directive.id,
-                                                      PathResolution {
-                                                          base_def: Def::Mod(did),
-                                                          depth: 0,
-                                                      });
+            let resolution = PathResolution { base_def: Def::Mod(did), depth: 0 };
+            self.resolver.def_map.insert(directive.id, resolution);
         }
 
         debug!("(resolving glob import) successfully resolved import");
@@ -691,19 +688,19 @@ impl<'a, 'b:'a, 'tcx:'b> ImportResolver<'a, 'b, 'tcx> {
 
             if let NameBindingKind::Import { binding: orig_binding, directive, .. } = binding.kind {
                 if ns == TypeNS && orig_binding.is_variant() &&
-                   !orig_binding.vis.is_at_least(binding.vis, &self.resolver.ast_map) {
+                   !orig_binding.vis.is_at_least(binding.vis, self.resolver) {
                     let msg = format!("variant `{}` is private, and cannot be reexported \
                                        (error E0364), consider declaring its enum as `pub`",
                                       name);
                     let lint = lint::builtin::PRIVATE_IN_PUBLIC;
-                    self.resolver.session.add_lint(lint, directive.id, binding.span.unwrap(), msg);
+                    self.resolver.session.add_lint(lint, directive.id, binding.span, msg);
                 }
             }
         }
 
         if reexports.len() > 0 {
             if let Some(def_id) = module.def_id() {
-                let node_id = self.resolver.ast_map.as_local_node_id(def_id).unwrap();
+                let node_id = self.resolver.definitions.as_local_node_id(def_id).unwrap();
                 self.resolver.export_map.insert(node_id, reexports);
             }
         }

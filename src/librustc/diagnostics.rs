@@ -115,7 +115,7 @@ trait Trait {
 
 Now, `foo()` can no longer be called on a trait object, but you will now be
 allowed to make a trait object, and that will be able to call any object-safe
-methods". With such a bound, one can still call `foo()` on types implementing
+methods. With such a bound, one can still call `foo()` on types implementing
 that trait that aren't behind trait objects.
 
 ### Method has generic type parameters
@@ -635,7 +635,17 @@ fn foo(x: u8) -> u8 {
 ```
 
 It is advisable to find out what the unhandled cases are and check for them,
-returning an appropriate value or panicking if necessary.
+returning an appropriate value or panicking if necessary. Check if you need
+to remove a semicolon from the last expression, like in this case:
+
+```ignore
+fn foo(x: u8) -> u8 {
+    inner(2*x + 1);
+}
+```
+
+The semicolon discards the return value of `inner`, instead of returning
+it from `foo`.
 "##,
 
 E0270: r##"
@@ -1569,5 +1579,5 @@ register_diagnostics! {
     E0490, // a value of type `..` is borrowed for too long
     E0491, // in type `..`, reference has a longer lifetime than the data it...
     E0495, // cannot infer an appropriate lifetime due to conflicting requirements
-    E0524, // expected a closure that implements `..` but this closure only implements `..`
+    E0525, // expected a closure that implements `..` but this closure only implements `..`
 }

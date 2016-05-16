@@ -202,8 +202,10 @@ fn test_resize_policy() {
 /// The hashes are all keyed by the thread-local random number generator
 /// on creation by default. This means that the ordering of the keys is
 /// randomized, but makes the tables more resistant to
-/// denial-of-service attacks (Hash DoS). This behavior can be
-/// overridden with one of the constructors.
+/// denial-of-service attacks (Hash DoS). No guarantees are made to the
+/// quality of the random data. The implementation uses the best available
+/// random data from your platform at the time of creation. This behavior
+/// can be overridden with one of the constructors.
 ///
 /// It is required that the keys implement the `Eq` and `Hash` traits, although
 /// this can frequently be achieved by using `#[derive(PartialEq, Eq, Hash)]`.
@@ -830,7 +832,7 @@ impl<K, V, S> HashMap<K, V, S>
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn keys<'a>(&'a self) -> Keys<'a, K, V> {
+    pub fn keys(&self) -> Keys<K, V> {
         Keys { inner: self.iter() }
     }
 
@@ -852,7 +854,7 @@ impl<K, V, S> HashMap<K, V, S>
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn values<'a>(&'a self) -> Values<'a, K, V> {
+    pub fn values(&self) -> Values<K, V> {
         Values { inner: self.iter() }
     }
 
@@ -880,7 +882,7 @@ impl<K, V, S> HashMap<K, V, S>
     /// }
     /// ```
     #[unstable(feature = "map_values_mut", reason = "recently added", issue = "32551")]
-    pub fn values_mut<'a>(&'a mut self) -> ValuesMut<'a, K, V> {
+    pub fn values_mut<'a>(&'a mut self) -> ValuesMut<K, V> {
         ValuesMut { inner: self.iter_mut() }
     }
 
@@ -1531,6 +1533,15 @@ impl<'a, K, V> Entry<'a, K, V> {
         match self {
             Occupied(entry) => entry.into_mut(),
             Vacant(entry) => entry.insert(default()),
+        }
+    }
+
+    /// Returns a reference to this entry's key.
+    #[unstable(feature = "map_entry_keys", issue = "32281")]
+    pub fn key(&self) -> &K {
+        match *self {
+            Occupied(ref entry) => entry.key(),
+            Vacant(ref entry) => entry.key(),
         }
     }
 }

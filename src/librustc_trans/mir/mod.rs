@@ -16,13 +16,13 @@ use rustc::mir::repr as mir;
 use rustc::mir::tcx::LvalueTy;
 use session::config::FullDebugInfo;
 use base;
-use common::{self, Block, BlockAndBuilder, FunctionContext};
+use common::{self, Block, BlockAndBuilder, CrateContext, FunctionContext};
 use debuginfo::{self, declare_local, DebugLoc, VariableAccess, VariableKind};
 use machine;
 use type_of;
 
 use syntax::codemap::DUMMY_SP;
-use syntax::parse::token;
+use syntax::parse::token::keywords;
 
 use std::ops::Deref;
 use std::rc::Rc;
@@ -31,10 +31,12 @@ use basic_block::BasicBlock;
 
 use rustc_data_structures::bitvec::BitVector;
 
+pub use self::constant::trans_static_initializer;
+
 use self::lvalue::{LvalueRef, get_dataptr, get_meta};
 use rustc_mir::traversal;
 
-use self::operand::OperandRef;
+use self::operand::{OperandRef, OperandValue};
 
 #[derive(Clone)]
 pub enum CachedMir<'mir, 'tcx: 'mir> {
@@ -108,6 +110,25 @@ enum TempRef<'tcx> {
     Operand(Option<OperandRef<'tcx>>),
 }
 
+impl<'tcx> TempRef<'tcx> {
+    fn new_operand<'bcx>(ccx: &CrateContext<'bcx, 'tcx>,
+                         ty: ty::Ty<'tcx>) -> TempRef<'tcx> {
+        if common::type_is_zero_size(ccx, ty) {
+            // Zero-size temporaries aren't always initialized, which
+            // doesn't matter because they don't contain data, but
+            // we need something in the operand.
+            let val = OperandValue::Immediate(common::C_nil(ccx));
+            let op = OperandRef {
+                val: val,
+                ty: ty
+            };
+            TempRef::Operand(Some(op))
+        } else {
+            TempRef::Operand(None)
+        }
+    }
+}
+
 ///////////////////////////////////////////////////////////////////////////
 
 pub fn trans_mir<'blk, 'tcx: 'blk>(fcx: &'blk FunctionContext<'blk, 'tcx>) {
@@ -154,7 +175,7 @@ pub fn trans_mir<'blk, 'tcx: 'blk>(fcx: &'blk FunctionContext<'blk, 'tcx>) {
                                   // If this is an immediate temp, we do not create an
                                   // alloca in advance. Instead we wait until we see the
                                   // definition and update the operand there.
-                                  TempRef::Operand(None)
+                                  TempRef::new_operand(bcx.ccx(), mty)
                               })
                               .collect();
 
@@ -286,7 +307,7 @@ fn arg_value_refs<'bcx, 'tcx>(bcx: &BlockAndBuilder<'bcx, 'tcx>,
                         alloca: lltemp,
                         address_operations: &ops
                     };
-                    declare_local(bcx, token::special_idents::invalid.name,
+                    declare_local(bcx, keywords::Invalid.name(),
                                   tupled_arg_ty, scope, variable_access,
                                   VariableKind::ArgumentVariable(arg_index + i + 1),
                                   bcx.fcx().span.unwrap_or(DUMMY_SP));

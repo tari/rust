@@ -11,8 +11,6 @@
 use llvm::ValueRef;
 use rustc::ty::{self, Ty};
 use rustc::ty::cast::{CastTy, IntTy};
-use middle::const_val::ConstVal;
-use rustc_const_math::ConstInt;
 use rustc::mir::repr as mir;
 
 use asm;
@@ -21,14 +19,13 @@ use callee::Callee;
 use common::{self, C_uint, BlockAndBuilder, Result};
 use datum::{Datum, Lvalue};
 use debuginfo::DebugLoc;
-use declare;
 use adt;
 use machine;
-use type_::Type;
 use type_of;
 use tvec;
 use value::Value;
 use Disr;
+use glue;
 
 use super::MirContext;
 use super::operand::{OperandRef, OperandValue};
@@ -56,6 +53,8 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
            }
 
             mir::Rvalue::Cast(mir::CastKind::Unsize, ref source, cast_ty) => {
+                let cast_ty = bcx.monomorphize(&cast_ty);
+
                 if common::type_is_fat_ptr(bcx.tcx(), cast_ty) {
                     // into-coerce of a thin pointer to a fat pointer - just
                     // use the operand path.
@@ -99,8 +98,8 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
 
             mir::Rvalue::Repeat(ref elem, ref count) => {
                 let tr_elem = self.trans_operand(&bcx, elem);
-                let count = ConstVal::Integral(ConstInt::Usize(count.value));
-                let size = self.trans_constval(&bcx, &count, bcx.tcx().types.usize).immediate();
+                let size = count.value.as_u64(bcx.tcx().sess.target.uint_type);
+                let size = C_uint(bcx.ccx(), size);
                 let base = get_dataptr(&bcx, dest.llval);
                 let bcx = bcx.map_block(|block| {
                     tvec::iter_vec_raw(block, base, tr_elem.ty, size, |block, llslot, _| {
@@ -155,7 +154,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                                                             span: DUMMY_SP
                                                         },
                                                         DUMMY_NODE_ID, def_id,
-                                                        &bcx.monomorphize(substs));
+                                                        bcx.monomorphize(&substs));
                         }
 
                         for (i, operand) in operands.iter().enumerate() {
@@ -217,7 +216,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
             }
 
             _ => {
-                assert!(rvalue_creates_operand(rvalue));
+                assert!(rvalue_creates_operand(&self.mir, &bcx, rvalue));
                 let (bcx, temp) = self.trans_rvalue_operand(bcx, rvalue, debug_loc);
                 self.store_operand(&bcx, dest.llval, temp);
                 bcx
@@ -231,7 +230,8 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                                 debug_loc: DebugLoc)
                                 -> (BlockAndBuilder<'bcx, 'tcx>, OperandRef<'tcx>)
     {
-        assert!(rvalue_creates_operand(rvalue), "cannot trans {:?} to operand", rvalue);
+        assert!(rvalue_creates_operand(&self.mir, &bcx, rvalue),
+                "cannot trans {:?} to operand", rvalue);
 
         match *rvalue {
             mir::Rvalue::Cast(ref kind, ref source, cast_ty) => {
@@ -403,7 +403,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
             mir::Rvalue::Len(ref lvalue) => {
                 let tr_lvalue = self.trans_lvalue(&bcx, lvalue);
                 let operand = OperandRef {
-                    val: OperandValue::Immediate(self.lvalue_len(&bcx, tr_lvalue)),
+                    val: OperandValue::Immediate(tr_lvalue.len(bcx.ccx())),
                     ty: bcx.tcx().types.usize,
                 };
                 (bcx, operand)
@@ -483,7 +483,10 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                 (bcx, operand)
             }
 
-            mir::Rvalue::Use(..) |
+            mir::Rvalue::Use(ref operand) => {
+                let operand = self.trans_operand(&bcx, operand);
+                (bcx, operand)
+            }
             mir::Rvalue::Repeat(..) |
             mir::Rvalue::Aggregate(..) |
             mir::Rvalue::Slice { .. } |
@@ -526,43 +529,7 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
                 bcx.udiv(lhs, rhs)
             },
             mir::BinOp::Rem => if is_float {
-                // LLVM currently always lowers the `frem` instructions appropriate
-                // library calls typically found in libm. Notably f64 gets wired up
-                // to `fmod` and f32 gets wired up to `fmodf`. Inconveniently for
-                // us, 32-bit MSVC does not actually have a `fmodf` symbol, it's
-                // instead just an inline function in a header that goes up to a
-                // f64, uses `fmod`, and then comes back down to a f32.
-                //
-                // Although LLVM knows that `fmodf` doesn't exist on MSVC, it will
-                // still unconditionally lower frem instructions over 32-bit floats
-                // to a call to `fmodf`. To work around this we special case MSVC
-                // 32-bit float rem instructions and instead do the call out to
-                // `fmod` ourselves.
-                //
-                // Note that this is currently duplicated with src/libcore/ops.rs
-                // which does the same thing, and it would be nice to perhaps unify
-                // these two implementations one day! Also note that we call `fmod`
-                // for both 32 and 64-bit floats because if we emit any FRem
-                // instruction at all then LLVM is capable of optimizing it into a
-                // 32-bit FRem (which we're trying to avoid).
-                let tcx = bcx.tcx();
-                let use_fmod = tcx.sess.target.target.options.is_like_msvc &&
-                    tcx.sess.target.target.arch == "x86";
-                if use_fmod {
-                    let f64t = Type::f64(bcx.ccx());
-                    let fty = Type::func(&[f64t, f64t], &f64t);
-                    let llfn = declare::declare_cfn(bcx.ccx(), "fmod", fty);
-                    if input_ty == tcx.types.f32 {
-                        let lllhs = bcx.fpext(lhs, f64t);
-                        let llrhs = bcx.fpext(rhs, f64t);
-                        let llres = bcx.call(llfn, &[lllhs, llrhs], None);
-                        bcx.fptrunc(llres, Type::f32(bcx.ccx()))
-                    } else {
-                        bcx.call(llfn, &[lhs, rhs], None)
-                    }
-                } else {
-                    bcx.frem(lhs, rhs)
-                }
+                bcx.frem(lhs, rhs)
             } else if is_signed {
                 bcx.srem(lhs, rhs)
             } else {
@@ -599,7 +566,9 @@ impl<'bcx, 'tcx> MirContext<'bcx, 'tcx> {
     }
 }
 
-pub fn rvalue_creates_operand<'tcx>(rvalue: &mir::Rvalue<'tcx>) -> bool {
+pub fn rvalue_creates_operand<'bcx, 'tcx>(mir: &mir::Mir<'tcx>,
+                                          bcx: &BlockAndBuilder<'bcx, 'tcx>,
+                                          rvalue: &mir::Rvalue<'tcx>) -> bool {
     match *rvalue {
         mir::Rvalue::Ref(..) |
         mir::Rvalue::Len(..) |
@@ -608,16 +577,20 @@ pub fn rvalue_creates_operand<'tcx>(rvalue: &mir::Rvalue<'tcx>) -> bool {
         mir::Rvalue::UnaryOp(..) |
         mir::Rvalue::Box(..) =>
             true,
-        mir::Rvalue::Use(..) | // (**)
         mir::Rvalue::Repeat(..) |
         mir::Rvalue::Aggregate(..) |
         mir::Rvalue::Slice { .. } |
         mir::Rvalue::InlineAsm { .. } =>
             false,
+        mir::Rvalue::Use(ref operand) => {
+            let ty = mir.operand_ty(bcx.tcx(), operand);
+            let ty = bcx.monomorphize(&ty);
+            // Types that don't need dropping can just be an operand,
+            // this allows temporary lvalues, used as rvalues, to
+            // avoid a stack slot when it's unnecessary
+            !glue::type_needs_drop(bcx.tcx(), ty)
+        }
     }
 
     // (*) this is only true if the type is suitable
-    // (**) we need to zero-out the source operand after moving, so we are restricted to either
-    // ensuring all users of `Use` zero it out themselves or not allowing to “create” operand for
-    // it.
 }

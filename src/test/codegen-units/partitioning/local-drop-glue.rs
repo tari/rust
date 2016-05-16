@@ -9,12 +9,15 @@
 // except according to those terms.
 
 // ignore-tidy-linelength
-// compile-flags:-Zprint-trans-items=lazy
+// We specify -Z incremental here because we want to test the partitioning for
+// incremental compilation
+// compile-flags:-Zprint-trans-items=lazy -Zincremental=tmp/partitioning-tests/local-drop-glue
 
 #![allow(dead_code)]
 #![crate_type="lib"]
 
 //~ TRANS_ITEM drop-glue local_drop_glue::Struct[0] @@ local_drop_glue[OnceODR] local_drop_glue-mod1[OnceODR]
+//~ TRANS_ITEM drop-glue-contents local_drop_glue::Struct[0] @@ local_drop_glue[OnceODR] local_drop_glue-mod1[OnceODR]
 struct Struct {
     _a: u32
 }

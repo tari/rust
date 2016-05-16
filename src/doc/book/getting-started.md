@@ -8,7 +8,7 @@ we’ll talk about Cargo, Rust’s build system and package manager.
 
 The first step to using Rust is to install it. Generally speaking, you’ll need
 an Internet connection to run the commands in this section, as we’ll be
-downloading Rust from the internet.
+downloading Rust from the Internet.
 
 We’ll be showing off a number of commands using a terminal, and those lines all
 start with `$`. We don't need to type in the `$`s, they are there to indicate
@@ -98,6 +98,7 @@ unofficial locations.
 |  Target                       | std |rustc|cargo| notes                      |
 |-------------------------------|-----|-----|-----|----------------------------|
 | `aarch64-linux-android`       |  ✓  |     |     | ARM64 Android              |
+| `armv7-linux-androideabi`     |  ✓  |     |     | ARM-v7a Android            |
 | `i686-linux-android`          |  ✓  |     |     | 32-bit x86 Android         |
 | `i686-pc-windows-msvc` (XP)   |  ✓  |     |     | Windows XP support         |
 | `i686-unknown-freebsd`        |  ✓  |  ✓  |  ✓  | 32-bit FreeBSD             |
@@ -399,20 +400,20 @@ Let’s convert the Hello World program to Cargo. To Cargo-fy a project, you nee
 to do three things:
 
 1. Put your source file in the right directory.
-2. Get rid of the old executable (`main.exe` on Windows, `main` everywhere else)
-   and make a new one.
+2. Get rid of the old executable (`main.exe` on Windows, `main` everywhere
+   else).
 3. Make a Cargo configuration file.
 
 Let's get started!
 
-### Creating a new Executable and Source Directory
+### Creating a Source Directory and Removing the Old Executable
 
 First, go back to your terminal, move to your *hello_world* directory, and
 enter the following commands:
 
 ```bash
 $ mkdir src
-$ mv main.rs src/main.rs
+$ mv main.rs src/main.rs # or 'move main.rs src/main.rs' on Windows
 $ rm main  # or 'del main.exe' on Windows
 ```
 

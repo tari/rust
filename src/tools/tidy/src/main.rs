@@ -19,6 +19,11 @@ use std::path::{PathBuf, Path};
 use std::env;
 
 macro_rules! t {
+    ($e:expr, $p:expr) => (match $e {
+        Ok(e) => e,
+        Err(e) => panic!("{} failed on {} with {}", stringify!($e), ($p).display(), e),
+    });
+
     ($e:expr) => (match $e {
         Ok(e) => e,
         Err(e) => panic!("{} failed with {}", stringify!($e), e),
@@ -30,6 +35,7 @@ mod style;
 mod errors;
 mod features;
 mod cargo;
+mod cargo_lock;
 
 fn main() {
     let path = env::args_os().skip(1).next().expect("need an argument");
@@ -41,6 +47,7 @@ fn main() {
     errors::check(&path, &mut bad);
     cargo::check(&path, &mut bad);
     features::check(&path, &mut bad);
+    cargo_lock::check(&path, &mut bad);
 
     if bad {
         panic!("some tidy checks failed");
@@ -63,7 +70,7 @@ fn filter_dirs(path: &Path) -> bool {
 
 
 fn walk(path: &Path, skip: &mut FnMut(&Path) -> bool, f: &mut FnMut(&Path)) {
-    for entry in t!(fs::read_dir(path)) {
+    for entry in t!(fs::read_dir(path), path) {
         let entry = t!(entry);
         let kind = t!(entry.file_type());
         let path = entry.path();

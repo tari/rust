@@ -19,7 +19,7 @@ use session::config::{OutputFilenames, Input, OutputType};
 use session::filesearch;
 use session::search_paths::PathKind;
 use session::Session;
-use middle::cstore::{self, CrateStore, LinkMeta};
+use middle::cstore::{self, LinkMeta};
 use middle::cstore::{LinkagePreference, NativeLibraryKind};
 use middle::dependency_format::Linkage;
 use CrateTranslation;
@@ -124,9 +124,9 @@ pub fn find_crate_name(sess: Option<&Session>,
 
 }
 
-pub fn build_link_meta(tcx: &TyCtxt,
-                       name: &str)
-                       -> LinkMeta {
+pub fn build_link_meta<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                                 name: &str)
+                                 -> LinkMeta {
     let r = LinkMeta {
         crate_name: name.to_owned(),
         crate_hash: tcx.calculate_krate_hash(),

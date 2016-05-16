@@ -14,21 +14,21 @@
 use std::hash::{Hash, SipHasher, Hasher};
 use rustc::hir::def_id::{CRATE_DEF_INDEX, DefId};
 use rustc::hir::svh::Svh;
-use rustc::ty;
+use rustc::ty::TyCtxt;
 use rustc::hir::intravisit::{self, Visitor};
 
 use self::svh_visitor::StrictVersionHashVisitor;
 
 pub trait SvhCalculate {
     /// Calculate the SVH for an entire krate.
-    fn calculate_krate_hash(&self) -> Svh;
+    fn calculate_krate_hash(self) -> Svh;
 
     /// Calculate the SVH for a particular item.
-    fn calculate_item_hash(&self, def_id: DefId) -> u64;
+    fn calculate_item_hash(self, def_id: DefId) -> u64;
 }
 
-impl<'tcx> SvhCalculate for ty::TyCtxt<'tcx> {
-    fn calculate_krate_hash(&self) -> Svh {
+impl<'a, 'tcx> SvhCalculate for TyCtxt<'a, 'tcx, 'tcx> {
+    fn calculate_krate_hash(self) -> Svh {
         // FIXME (#14132): This is better than it used to be, but it still not
         // ideal. We now attempt to hash only the relevant portions of the
         // Crate AST as well as the top-level crate attributes. (However,
@@ -75,7 +75,7 @@ impl<'tcx> SvhCalculate for ty::TyCtxt<'tcx> {
         Svh::from_hash(state.finish())
     }
 
-    fn calculate_item_hash(&self, def_id: DefId) -> u64 {
+    fn calculate_item_hash(self, def_id: DefId) -> u64 {
         assert!(def_id.is_local());
 
         let mut state = SipHasher::new();
@@ -109,7 +109,7 @@ mod svh_visitor {
     use syntax::ast::{self, Name, NodeId};
     use syntax::codemap::Span;
     use syntax::parse::token;
-    use rustc::ty;
+    use rustc::ty::TyCtxt;
     use rustc::hir;
     use rustc::hir::*;
     use rustc::hir::intravisit as visit;
@@ -118,13 +118,13 @@ mod svh_visitor {
     use std::hash::{Hash, SipHasher};
 
     pub struct StrictVersionHashVisitor<'a, 'tcx: 'a> {
-        pub tcx: &'a ty::TyCtxt<'tcx>,
+        pub tcx: TyCtxt<'a, 'tcx, 'tcx>,
         pub st: &'a mut SipHasher,
     }
 
     impl<'a, 'tcx> StrictVersionHashVisitor<'a, 'tcx> {
         pub fn new(st: &'a mut SipHasher,
-                   tcx: &'a ty::TyCtxt<'tcx>)
+                   tcx: TyCtxt<'a, 'tcx, 'tcx>)
                    -> Self {
             StrictVersionHashVisitor { st: st, tcx: tcx }
         }
@@ -172,7 +172,6 @@ mod svh_visitor {
         SawImplItem,
         SawStructField,
         SawVariant,
-        SawExplicitSelf,
         SawPath,
         SawBlock,
         SawPat,
@@ -389,10 +388,6 @@ mod svh_visitor {
 
         fn visit_struct_field(&mut self, s: &'a StructField) {
             SawStructField.hash(self.st); visit::walk_struct_field(self, s)
-        }
-
-        fn visit_explicit_self(&mut self, es: &'a ExplicitSelf) {
-            SawExplicitSelf.hash(self.st); visit::walk_explicit_self(self, es)
         }
 
         fn visit_path(&mut self, path: &'a Path, _: ast::NodeId) {

@@ -20,8 +20,8 @@ use rustc::hir::map as hir_map;
 use rustc::lint;
 use rustc_trans::back::link;
 use rustc_resolve as resolve;
-use rustc::hir::lowering::{lower_crate, LoweringContext};
 use rustc_metadata::cstore::CStore;
+use rustc_metadata::creader::read_local_crates;
 
 use syntax::{ast, codemap, errors};
 use syntax::errors::emitter::ColorConfig;
@@ -29,7 +29,7 @@ use syntax::feature_gate::UnstableFeatures;
 use syntax::parse::token;
 
 use std::cell::{RefCell, Cell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use visit_ast::RustdocVisitor;
@@ -42,7 +42,7 @@ pub use rustc::session::search_paths::SearchPaths;
 
 /// Are we generating documentation (`Typed`) or tests (`NotTyped`)?
 pub enum MaybeTyped<'a, 'tcx: 'a> {
-    Typed(&'a TyCtxt<'tcx>),
+    Typed(TyCtxt<'a, 'tcx, 'tcx>),
     NotTyped(&'a session::Session)
 }
 
@@ -53,7 +53,7 @@ pub struct DocContext<'a, 'tcx: 'a> {
     pub map: &'a hir_map::Map<'tcx>,
     pub maybe_typed: MaybeTyped<'a, 'tcx>,
     pub input: Input,
-    pub all_crate_impls: RefCell<HashMap<ast::CrateNum, Vec<clean::Item>>>,
+    pub populated_crate_impls: RefCell<HashSet<ast::CrateNum>>,
     pub deref_trait_did: Cell<Option<DefId>>,
     // Note that external items for which `doc(hidden)` applies to are shown as
     // non-reachable while local items aren't. This is because we're reusing
@@ -74,14 +74,14 @@ impl<'b, 'tcx> DocContext<'b, 'tcx> {
         }
     }
 
-    pub fn tcx_opt<'a>(&'a self) -> Option<&'a TyCtxt<'tcx>> {
+    pub fn tcx_opt<'a>(&'a self) -> Option<TyCtxt<'a, 'tcx, 'tcx>> {
         match self.maybe_typed {
             Typed(tcx) => Some(tcx),
             NotTyped(_) => None
         }
     }
 
-    pub fn tcx<'a>(&'a self) -> &'a TyCtxt<'tcx> {
+    pub fn tcx<'a>(&'a self) -> TyCtxt<'a, 'tcx, 'tcx> {
         let tcx_opt = self.tcx_opt();
         tcx_opt.expect("tcx not present")
     }
@@ -151,18 +151,26 @@ pub fn run_core(search_paths: SearchPaths,
                     .expect("phase_2_configure_and_expand aborted in rustdoc!");
 
     let krate = driver::assign_node_ids(&sess, krate);
-    // Lower ast -> hir.
-    let lcx = LoweringContext::new(&sess, Some(&krate));
-    let mut hir_forest = hir_map::Forest::new(lower_crate(&lcx, &krate), DepGraph::new(false));
+    let dep_graph = DepGraph::new(false);
+
+    let mut defs = hir_map::collect_definitions(&krate);
+    read_local_crates(&sess, &cstore, &defs, &krate, &name, &dep_graph);
+
+    // Lower ast -> hir and resolve.
+    let (analysis, resolutions, mut hir_forest) = {
+        driver::lower_and_resolve(&sess, &name, &mut defs, &krate, dep_graph,
+                                  resolve::MakeGlobMap::No)
+    };
+
     let arenas = ty::CtxtArenas::new();
-    let hir_map = driver::make_map(&sess, &mut hir_forest);
+    let hir_map = hir_map::map_crate(&mut hir_forest, defs);
 
     abort_on_err(driver::phase_3_run_analysis_passes(&sess,
-                                                     &cstore,
                                                      hir_map,
+                                                     analysis,
+                                                     resolutions,
                                                      &arenas,
                                                      &name,
-                                                     resolve::MakeGlobMap::No,
                                                      |tcx, _, analysis, result| {
         // Return if the driver hit an err (in `result`)
         if let Err(_) = result {
@@ -184,7 +192,7 @@ pub fn run_core(search_paths: SearchPaths,
             map: &tcx.map,
             maybe_typed: Typed(tcx),
             input: input,
-            all_crate_impls: RefCell::new(HashMap::new()),
+            populated_crate_impls: RefCell::new(HashSet::new()),
             deref_trait_did: Cell::new(None),
             access_levels: RefCell::new(access_levels),
             external_traits: RefCell::new(HashMap::new()),

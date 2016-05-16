@@ -21,6 +21,7 @@
 extern crate libc;
 extern crate test;
 extern crate getopts;
+extern crate serialize as rustc_serialize;
 
 #[macro_use]
 extern crate log;
@@ -29,17 +30,21 @@ extern crate log;
 extern crate env_logger;
 
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use getopts::{optopt, optflag, reqopt};
 use common::Config;
-use common::{Pretty, DebugInfoGdb, DebugInfoLldb};
+use common::{Pretty, DebugInfoGdb, DebugInfoLldb, Mode};
 use test::TestPaths;
 use util::logv;
 
+use self::header::EarlyProps;
+
 pub mod procsrv;
 pub mod util;
+mod json;
 pub mod header;
 pub mod runtest;
 pub mod common;
@@ -70,13 +75,13 @@ pub fn parse_config(args: Vec<String> ) -> Config {
           reqopt("", "run-lib-path", "path to target shared libraries", "PATH"),
           reqopt("", "rustc-path", "path to rustc to use for compiling", "PATH"),
           reqopt("", "rustdoc-path", "path to rustdoc to use for compiling", "PATH"),
-          reqopt("", "python", "path to python to use for doc tests", "PATH"),
+          reqopt("", "lldb-python", "path to python to use for doc tests", "PATH"),
+          reqopt("", "docck-python", "path to python to use for doc tests", "PATH"),
           optopt("", "valgrind-path", "path to Valgrind executable for Valgrind tests", "PROGRAM"),
           optflag("", "force-valgrind", "fail if Valgrind tests cannot be run under Valgrind"),
           optopt("", "llvm-filecheck", "path to LLVM's FileCheck binary", "DIR"),
           reqopt("", "src-base", "directory to scan for test files", "PATH"),
           reqopt("", "build-base", "directory to deposit test outputs", "PATH"),
-          reqopt("", "aux-base", "directory to find auxiliary test files", "PATH"),
           reqopt("", "stage-id", "the target-stage identifier", "stageN-TARGET"),
           reqopt("", "mode", "which sort of compile tests to run",
                  "(compile-fail|parse-fail|run-fail|run-pass|\
@@ -97,6 +102,11 @@ pub fn parse_config(args: Vec<String> ) -> Config {
           optopt("", "adb-path", "path to the android debugger", "PATH"),
           optopt("", "adb-test-dir", "path to tests for the android debugger", "PATH"),
           optopt("", "lldb-python-dir", "directory containing LLDB's python module", "PATH"),
+          reqopt("", "cc", "path to a C compiler", "PATH"),
+          reqopt("", "cxx", "path to a C++ compiler", "PATH"),
+          reqopt("", "cflags", "flags for the C compiler", "FLAGS"),
+          reqopt("", "llvm-components", "list of LLVM components built in", "LIST"),
+          reqopt("", "llvm-cxxflags", "C++ flags for LLVM", "FLAGS"),
           optflag("h", "help", "show this message"));
 
     let (argv0, args_) = args.split_first().unwrap();
@@ -140,13 +150,13 @@ pub fn parse_config(args: Vec<String> ) -> Config {
         run_lib_path: make_absolute(opt_path(matches, "run-lib-path")),
         rustc_path: opt_path(matches, "rustc-path"),
         rustdoc_path: opt_path(matches, "rustdoc-path"),
-        python: matches.opt_str("python").unwrap(),
+        lldb_python: matches.opt_str("lldb-python").unwrap(),
+        docck_python: matches.opt_str("docck-python").unwrap(),
         valgrind_path: matches.opt_str("valgrind-path"),
         force_valgrind: matches.opt_present("force-valgrind"),
         llvm_filecheck: matches.opt_str("llvm-filecheck").map(|s| PathBuf::from(&s)),
         src_base: opt_path(matches, "src-base"),
         build_base: opt_path(matches, "build-base"),
-        aux_base: opt_path(matches, "aux-base"),
         stage_id: matches.opt_str("stage-id").unwrap(),
         mode: matches.opt_str("mode").unwrap().parse().ok().expect("invalid mode"),
         run_ignored: matches.opt_present("ignored"),
@@ -171,6 +181,12 @@ pub fn parse_config(args: Vec<String> ) -> Config {
         lldb_python_dir: matches.opt_str("lldb-python-dir"),
         verbose: matches.opt_present("verbose"),
         quiet: matches.opt_present("quiet"),
+
+        cc: matches.opt_str("cc").unwrap(),
+        cxx: matches.opt_str("cxx").unwrap(),
+        cflags: matches.opt_str("cflags").unwrap(),
+        llvm_components: matches.opt_str("llvm-components").unwrap(),
+        llvm_cxxflags: matches.opt_str("llvm-cxxflags").unwrap(),
     }
 }
 
@@ -245,6 +261,11 @@ pub fn run_tests(config: &Config) {
         _ => { /* proceed */ }
     }
 
+    // FIXME(#33435) Avoid spurious failures in codegen-units/partitioning tests.
+    if let Mode::CodegenUnits = config.mode {
+        let _ = fs::remove_dir_all("tmp/partitioning-tests");
+    }
+
     let opts = test_opts(config);
     let tests = make_tests(config);
     // sadly osx needs some file descriptor limits raised for running tests in
@@ -303,26 +324,39 @@ fn collect_tests_from_dir(config: &Config,
     // `compiletest-ignore-dir`.
     for file in fs::read_dir(dir)? {
         let file = file?;
-        if file.file_name() == *"compiletest-ignore-dir" {
+        let name = file.file_name();
+        if name == *"compiletest-ignore-dir" {
             return Ok(());
+        }
+        if name == *"Makefile" && config.mode == Mode::RunMake {
+            let paths = TestPaths {
+                file: dir.to_path_buf(),
+                base: base.to_path_buf(),
+                relative_dir: relative_dir_path.parent().unwrap().to_path_buf(),
+            };
+            tests.push(make_test(config, &paths));
+            return Ok(())
         }
     }
 
+    // If we find a test foo/bar.rs, we have to build the
+    // output directory `$build/foo` so we can write
+    // `$build/foo/bar` into it. We do this *now* in this
+    // sequential loop because otherwise, if we do it in the
+    // tests themselves, they race for the privilege of
+    // creating the directories and sometimes fail randomly.
+    let build_dir = config.build_base.join(&relative_dir_path);
+    fs::create_dir_all(&build_dir).unwrap();
+
+    // Add each `.rs` file as a test, and recurse further on any
+    // subdirectories we find, except for `aux` directories.
     let dirs = fs::read_dir(dir)?;
     for file in dirs {
         let file = file?;
         let file_path = file.path();
-        debug!("inspecting file {:?}", file_path.display());
-        if is_test(config, &file_path) {
-            // If we find a test foo/bar.rs, we have to build the
-            // output directory `$build/foo` so we can write
-            // `$build/foo/bar` into it. We do this *now* in this
-            // sequential loop because otherwise, if we do it in the
-            // tests themselves, they race for the privilege of
-            // creating the directories and sometimes fail randomly.
-            let build_dir = config.build_base.join(&relative_dir_path);
-            fs::create_dir_all(&build_dir).unwrap();
-
+        let file_name = file.file_name();
+        if is_test(&file_name) {
+            debug!("found test file: {:?}", file_path.display());
             let paths = TestPaths {
                 file: file_path,
                 base: base.to_path_buf(),
@@ -331,45 +365,43 @@ fn collect_tests_from_dir(config: &Config,
             tests.push(make_test(config, &paths))
         } else if file_path.is_dir() {
             let relative_file_path = relative_dir_path.join(file.file_name());
-            collect_tests_from_dir(config,
-                                   base,
-                                   &file_path,
-                                   &relative_file_path,
-                                   tests)?;
+            if &file_name == "auxiliary" {
+                // `aux` directories contain other crates used for
+                // cross-crate tests. Don't search them for tests, but
+                // do create a directory in the build dir for them,
+                // since we will dump intermediate output in there
+                // sometimes.
+                let build_dir = config.build_base.join(&relative_file_path);
+                fs::create_dir_all(&build_dir).unwrap();
+            } else {
+                debug!("found directory: {:?}", file_path.display());
+                collect_tests_from_dir(config,
+                                       base,
+                                       &file_path,
+                                       &relative_file_path,
+                                       tests)?;
+            }
+        } else {
+            debug!("found other file/directory: {:?}", file_path.display());
         }
     }
     Ok(())
 }
 
-pub fn is_test(config: &Config, testfile: &Path) -> bool {
-    // Pretty-printer does not work with .rc files yet
-    let valid_extensions =
-        match config.mode {
-          Pretty => vec!(".rs".to_owned()),
-          _ => vec!(".rc".to_owned(), ".rs".to_owned())
-        };
-    let invalid_prefixes = vec!(".".to_owned(), "#".to_owned(), "~".to_owned());
-    let name = testfile.file_name().unwrap().to_str().unwrap();
+pub fn is_test(file_name: &OsString) -> bool {
+    let file_name = file_name.to_str().unwrap();
 
-    let mut valid = false;
-
-    for ext in &valid_extensions {
-        if name.ends_with(ext) {
-            valid = true;
-        }
+    if !file_name.ends_with(".rs") {
+        return false;
     }
 
-    for pre in &invalid_prefixes {
-        if name.starts_with(pre) {
-            valid = false;
-        }
-    }
-
-    return valid;
+    // `.`, `#`, and `~` are common temp-file prefixes.
+    let invalid_prefixes = &[".", "#", "~"];
+    !invalid_prefixes.iter().any(|p| file_name.starts_with(p))
 }
 
 pub fn make_test(config: &Config, testpaths: &TestPaths) -> test::TestDescAndFn {
-    let early_props = header::early_props(config, &testpaths.file);
+    let early_props = EarlyProps::from_file(config, &testpaths.file);
 
     // The `should-fail` annotation doesn't apply to pretty tests,
     // since we run the pretty printer across all tests by default.

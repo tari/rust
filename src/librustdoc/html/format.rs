@@ -26,6 +26,7 @@ use rustc::hir;
 use clean;
 use core::DocAccessLevels;
 use html::item_type::ItemType;
+use html::escape::Escape;
 use html::render;
 use html::render::{cache, CURRENT_LOCATION_KEY};
 
@@ -42,7 +43,7 @@ pub struct UnsafetySpace(pub hir::Unsafety);
 #[derive(Copy, Clone)]
 pub struct ConstnessSpace(pub hir::Constness);
 /// Wrapper struct for properly emitting a method declaration.
-pub struct Method<'a>(pub &'a clean::SelfTy, pub &'a clean::FnDecl);
+pub struct Method<'a>(pub &'a clean::FnDecl);
 /// Similar to VisSpace, but used for mutability
 #[derive(Copy, Clone)]
 pub struct MutableSpace(pub clean::Mutability);
@@ -56,6 +57,11 @@ pub struct TyParamBounds<'a>(pub &'a [clean::TyParamBound]);
 /// Wrapper struct for emitting a comma-separated list of items
 pub struct CommaSep<'a, T: 'a>(pub &'a [T]);
 pub struct AbiSpace(pub Abi);
+
+pub struct HRef<'a> {
+    pub did: DefId,
+    pub text: &'a str,
+}
 
 impl<'a> VisSpace<'a> {
     pub fn get(self) -> &'a Option<clean::Visibility> {
@@ -291,17 +297,19 @@ impl fmt::Display for clean::Path {
 
 pub fn href(did: DefId) -> Option<(String, ItemType, Vec<String>)> {
     let cache = cache();
+    if !did.is_local() && !cache.access_levels.is_doc_reachable(did) {
+        return None
+    }
+
     let loc = CURRENT_LOCATION_KEY.with(|l| l.borrow().clone());
     let &(ref fqp, shortty) = match cache.paths.get(&did) {
         Some(p) => p,
         None => return None,
     };
+
     let mut url = if did.is_local() || cache.inlined.contains(&did) {
         repeat("../").take(loc.len()).collect::<String>()
     } else {
-        if !cache.access_levels.is_doc_reachable(did) {
-            return None
-        }
         match cache.extern_locations[&did.krate] {
             (_, render::Remote(ref s)) => s.to_string(),
             (_, render::Local) => repeat("../").take(loc.len()).collect(),
@@ -361,15 +369,7 @@ fn resolved_path(w: &mut fmt::Formatter, did: DefId, path: &clean::Path,
             }
         }
     }
-
-    match href(did) {
-        Some((url, shortty, fqp)) => {
-            write!(w, "<a class='{}' href='{}' title='{}'>{}</a>",
-                   shortty, url, fqp.join("::"), last.name)?;
-        }
-        _ => write!(w, "{}", last.name)?,
-    }
-    write!(w, "{}", last.params)?;
+    write!(w, "{}{}", HRef::new(did, &last.name), last.params)?;
     Ok(())
 }
 
@@ -435,6 +435,24 @@ fn tybounds(w: &mut fmt::Formatter,
     }
 }
 
+impl<'a> HRef<'a> {
+    pub fn new(did: DefId, text: &'a str) -> HRef<'a> {
+        HRef { did: did, text: text }
+    }
+}
+
+impl<'a> fmt::Display for HRef<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match href(self.did) {
+            Some((url, shortty, fqp)) => {
+                write!(f, "<a class='{}' href='{}' title='{}'>{}</a>",
+                       shortty, url, fqp.join("::"), self.text)
+            }
+            _ => write!(f, "{}", self.text),
+        }
+    }
+}
+
 impl fmt::Display for clean::Type {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
@@ -451,11 +469,7 @@ impl fmt::Display for clean::Type {
             clean::BareFunction(ref decl) => {
                 write!(f, "{}{}fn{}{}",
                        UnsafetySpace(decl.unsafety),
-                       match &*decl.abi {
-                           "" => " extern ".to_string(),
-                           "\"Rust\"" => "".to_string(),
-                           s => format!(" extern {} ", s)
-                       },
+                       AbiSpace(decl.abi),
                        decl.generics,
                        decl.decl)
             }
@@ -483,7 +497,7 @@ impl fmt::Display for clean::Type {
                 primitive_link(f, clean::PrimitiveType::Array, "[")?;
                 write!(f, "{}", t)?;
                 primitive_link(f, clean::PrimitiveType::Array,
-                               &format!("; {}]", *s))
+                               &format!("; {}]", Escape(s)))
             }
             clean::Bottom => f.write_str("!"),
             clean::RawPointer(m, ref t) => {
@@ -573,7 +587,13 @@ fn fmt_impl(i: &clean::Impl, f: &mut fmt::Formatter, link_trait: bool) -> fmt::R
         if link_trait {
             write!(f, "{}", *ty)?;
         } else {
-            write!(f, "{}", ty.trait_name().unwrap())?;
+            match *ty {
+                clean::ResolvedPath{ typarams: None, ref path, is_generic: false, .. } => {
+                    let last = path.segments.last().unwrap();
+                    write!(f, "{}{}", last.name, last.params)?;
+                }
+                _ => unreachable!(),
+            }
         }
         write!(f, " for ")?;
     }
@@ -628,29 +648,31 @@ impl fmt::Display for clean::FnDecl {
 
 impl<'a> fmt::Display for Method<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let Method(selfty, d) = *self;
+        let decl = self.0;
         let mut args = String::new();
-        match *selfty {
-            clean::SelfStatic => {},
-            clean::SelfValue => args.push_str("self"),
-            clean::SelfBorrowed(Some(ref lt), mtbl) => {
-                args.push_str(&format!("&amp;{} {}self", *lt, MutableSpace(mtbl)));
-            }
-            clean::SelfBorrowed(None, mtbl) => {
-                args.push_str(&format!("&amp;{}self", MutableSpace(mtbl)));
-            }
-            clean::SelfExplicit(ref typ) => {
-                args.push_str(&format!("self: {}", *typ));
-            }
-        }
-        for (i, input) in d.inputs.values.iter().enumerate() {
+        for (i, input) in decl.inputs.values.iter().enumerate() {
             if i > 0 || !args.is_empty() { args.push_str(", "); }
-            if !input.name.is_empty() {
-                args.push_str(&format!("{}: ", input.name));
+            if let Some(selfty) = input.to_self() {
+                match selfty {
+                    clean::SelfValue => args.push_str("self"),
+                    clean::SelfBorrowed(Some(ref lt), mtbl) => {
+                        args.push_str(&format!("&amp;{} {}self", *lt, MutableSpace(mtbl)));
+                    }
+                    clean::SelfBorrowed(None, mtbl) => {
+                        args.push_str(&format!("&amp;{}self", MutableSpace(mtbl)));
+                    }
+                    clean::SelfExplicit(ref typ) => {
+                        args.push_str(&format!("self: {}", *typ));
+                    }
+                }
+            } else {
+                if !input.name.is_empty() {
+                    args.push_str(&format!("{}: ", input.name));
+                }
+                args.push_str(&format!("{}", input.type_));
             }
-            args.push_str(&format!("{}", input.type_));
         }
-        write!(f, "({args}){arrow}", args = args, arrow = d.output)
+        write!(f, "({args}){arrow}", args = args, arrow = decl.output)
     }
 }
 
@@ -771,7 +793,7 @@ impl fmt::Display for AbiSpace {
         match self.0 {
             Abi::Rust => Ok(()),
             Abi::C => write!(f, "extern "),
-            abi => write!(f, "extern {} ", abi),
+            abi => write!(f, "extern &quot;{}&quot; ", abi.name()),
         }
     }
 }

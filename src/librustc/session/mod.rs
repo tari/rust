@@ -12,6 +12,7 @@ use lint;
 use middle::cstore::CrateStore;
 use middle::dependency_format;
 use session::search_paths::PathKind;
+use session::config::PanicStrategy;
 use ty::tls;
 use util::nodemap::{NodeMap, FnvHashMap};
 use mir::transform as mir_pass;
@@ -82,9 +83,11 @@ pub struct Session {
     /// operations such as auto-dereference and monomorphization.
     pub recursion_limit: Cell<usize>,
 
-    /// The metadata::creader module may inject an allocator dependency if it
-    /// didn't already find one, and this tracks what was injected.
+    /// The metadata::creader module may inject an allocator/panic_runtime
+    /// dependency if it didn't already find one, and this tracks what was
+    /// injected.
     pub injected_allocator: Cell<Option<ast::CrateNum>>,
+    pub injected_panic_runtime: Cell<Option<ast::CrateNum>>,
 
     /// Names of all bang-style macros and syntax extensions
     /// available in this crate
@@ -295,7 +298,8 @@ impl Session {
         self.opts.cg.lto
     }
     pub fn no_landing_pads(&self) -> bool {
-        self.opts.debugging_opts.no_landing_pads
+        self.opts.debugging_opts.no_landing_pads ||
+            self.opts.cg.panic == PanicStrategy::Abort
     }
     pub fn unstable_options(&self) -> bool {
         self.opts.debugging_opts.unstable_options
@@ -408,6 +412,19 @@ pub fn build_session(sopts: config::Options,
                      registry: diagnostics::registry::Registry,
                      cstore: Rc<for<'a> CrateStore<'a>>)
                      -> Session {
+    build_session_with_codemap(sopts,
+                              local_crate_source_file,
+                              registry,
+                              cstore,
+                              Rc::new(codemap::CodeMap::new()))
+}
+
+pub fn build_session_with_codemap(sopts: config::Options,
+                                  local_crate_source_file: Option<PathBuf>,
+                                  registry: diagnostics::registry::Registry,
+                                  cstore: Rc<for<'a> CrateStore<'a>>,
+                                  codemap: Rc<codemap::CodeMap>)
+                                  -> Session {
     // FIXME: This is not general enough to make the warning lint completely override
     // normal diagnostic warnings, since the warning lint can also be denied and changed
     // later via the source code.
@@ -419,7 +436,6 @@ pub fn build_session(sopts: config::Options,
         .unwrap_or(true);
     let treat_err_as_bug = sopts.treat_err_as_bug;
 
-    let codemap = Rc::new(codemap::CodeMap::new());
     let emitter: Box<Emitter> = match sopts.error_format {
         config::ErrorOutputType::HumanReadable(color_config) => {
             Box::new(EmitterWriter::stderr(color_config, Some(registry), codemap.clone()))
@@ -490,6 +506,7 @@ pub fn build_session_(sopts: config::Options,
         recursion_limit: Cell::new(64),
         next_node_id: Cell::new(1),
         injected_allocator: Cell::new(None),
+        injected_panic_runtime: Cell::new(None),
         available_macros: RefCell::new(HashSet::new()),
         imported_macro_spans: RefCell::new(HashMap::new()),
     };
@@ -535,9 +552,6 @@ unsafe fn configure_llvm(sess: &Session) {
         if sess.time_llvm_passes() { add("-time-passes"); }
         if sess.print_llvm_passes() { add("-debug-pass=Structure"); }
 
-        // FIXME #21627 disable faulty FastISel on AArch64 (even for -O0)
-        if sess.target.target.arch == "aarch64" { add("-fast-isel=0"); }
-
         for arg in &sess.opts.cg.llvm_args {
             add(&(*arg));
         }
@@ -558,7 +572,7 @@ pub fn early_error(output: config::ErrorOutputType, msg: &str) -> ! {
         }
         config::ErrorOutputType::Json => Box::new(JsonEmitter::basic()),
     };
-    emitter.emit(None, msg, None, errors::Level::Fatal);
+    emitter.emit(&MultiSpan::new(), msg, None, errors::Level::Fatal);
     panic!(errors::FatalError);
 }
 
@@ -569,7 +583,7 @@ pub fn early_warn(output: config::ErrorOutputType, msg: &str) {
         }
         config::ErrorOutputType::Json => Box::new(JsonEmitter::basic()),
     };
-    emitter.emit(None, msg, None, errors::Level::Warning);
+    emitter.emit(&MultiSpan::new(), msg, None, errors::Level::Warning);
 }
 
 // Err(0) means compilation was stopped, but no errors were found.

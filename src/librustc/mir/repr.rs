@@ -36,6 +36,11 @@ pub struct Mir<'tcx> {
     /// used (eventually) for debuginfo. Indexed by a `ScopeId`.
     pub scopes: Vec<ScopeData>,
 
+    /// Rvalues promoted from this function, such as borrows of constants.
+    /// Each of them is the Mir of a constant with the fn's type parameters
+    /// in scope, but no vars or args and a separate set of temps.
+    pub promoted: Vec<Mir<'tcx>>,
+
     /// Return type of the function.
     pub return_ty: FnOutput<'tcx>,
 
@@ -200,7 +205,7 @@ pub struct ArgDecl<'tcx> {
     /// and has to be collected from multiple actual arguments.
     pub spread: bool,
 
-    /// Either special_idents::invalid or the name of a single-binding
+    /// Either keywords::Invalid or the name of a single-binding
     /// pattern associated with this argument. Useful for debuginfo.
     pub debug_name: Name
 }
@@ -811,7 +816,7 @@ pub enum AggregateKind<'tcx> {
     Vec,
     Tuple,
     Adt(AdtDef<'tcx>, usize, &'tcx Substs<'tcx>),
-    Closure(DefId, &'tcx ClosureSubsts<'tcx>),
+    Closure(DefId, ClosureSubsts<'tcx>),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, RustcEncodable, RustcDecodable)]
@@ -987,6 +992,10 @@ pub enum Literal<'tcx> {
     Value {
         value: ConstVal,
     },
+    Promoted {
+        // Index into the `promoted` vector of `Mir`.
+        index: usize
+    },
 }
 
 impl<'tcx> Debug for Constant<'tcx> {
@@ -1006,6 +1015,9 @@ impl<'tcx> Debug for Literal<'tcx> {
             Value { ref value } => {
                 write!(fmt, "const ")?;
                 fmt_const_val(fmt, value)
+            }
+            Promoted { index } => {
+                write!(fmt, "promoted{}", index)
             }
         }
     }

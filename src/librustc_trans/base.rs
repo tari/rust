@@ -35,9 +35,7 @@ use lint;
 use llvm::{BasicBlockRef, Linkage, ValueRef, Vector, get_param};
 use llvm;
 use rustc::cfg;
-use middle::cstore::CrateStore;
 use rustc::hir::def_id::DefId;
-use rustc::infer;
 use middle::lang_items::{LangItem, ExchangeMallocFnLangItem, StartFnLangItem};
 use middle::weak_lang_items;
 use rustc::hir::pat_util::simple_name;
@@ -58,11 +56,10 @@ use attributes;
 use build::*;
 use builder::{Builder, noname};
 use callee::{Callee, CallArgs, ArgExprs, ArgVals};
-use partitioning;
 use cleanup::{self, CleanupMethods, DropHint};
 use closure;
 use common::{Block, C_bool, C_bytes_in_context, C_i32, C_int, C_uint, C_integral};
-use collector::{self, TransItem, TransItemState, TransItemCollectionMode};
+use collector::{self, TransItemState, TransItemCollectionMode};
 use common::{C_null, C_struct_in_context, C_u64, C_u8, C_undef};
 use common::{CrateContext, DropFlagHintsMap, Field, FunctionContext};
 use common::{Result, NodeIdAndSpan, VariantInfo};
@@ -70,7 +67,7 @@ use common::{node_id_type, fulfill_obligation};
 use common::{type_is_immediate, type_is_zero_size, val_ty};
 use common;
 use consts;
-use context::SharedCrateContext;
+use context::{SharedCrateContext, CrateContextList};
 use controlflow;
 use datum;
 use debuginfo::{self, DebugLoc, ToDebugLoc};
@@ -83,7 +80,9 @@ use machine::{llalign_of_min, llsize_of, llsize_of_real};
 use meth;
 use mir;
 use monomorphize::{self, Instance};
+use partitioning::{self, PartitioningStrategy, CodegenUnit};
 use symbol_names_test;
+use trans_item::TransItem;
 use tvec;
 use type_::Type;
 use type_of;
@@ -665,7 +664,7 @@ pub fn coerce_unsized_into<'blk, 'tcx>(bcx: Block<'blk, 'tcx>,
     }
 }
 
-pub fn custom_coerce_unsize_info<'ccx, 'tcx>(ccx: &CrateContext<'ccx, 'tcx>,
+pub fn custom_coerce_unsize_info<'scx, 'tcx>(scx: &SharedCrateContext<'scx, 'tcx>,
                                              source_ty: Ty<'tcx>,
                                              target_ty: Ty<'tcx>)
                                              -> CustomCoerceUnsized {
@@ -675,13 +674,13 @@ pub fn custom_coerce_unsize_info<'ccx, 'tcx>(ccx: &CrateContext<'ccx, 'tcx>,
                                    subst::VecPerParamSpace::empty());
 
     let trait_ref = ty::Binder(ty::TraitRef {
-        def_id: ccx.tcx().lang_items.coerce_unsized_trait().unwrap(),
-        substs: ccx.tcx().mk_substs(trait_substs)
+        def_id: scx.tcx().lang_items.coerce_unsized_trait().unwrap(),
+        substs: scx.tcx().mk_substs(trait_substs)
     });
 
-    match fulfill_obligation(ccx, DUMMY_SP, trait_ref) {
+    match fulfill_obligation(scx, DUMMY_SP, trait_ref) {
         traits::VtableImpl(traits::VtableImplData { impl_def_id, .. }) => {
-            ccx.tcx().custom_coerce_unsized_kind(impl_def_id)
+            scx.tcx().custom_coerce_unsized_kind(impl_def_id)
         }
         vtable => {
             bug!("invalid CoerceUnsized vtable: {:?}", vtable);
@@ -1310,7 +1309,9 @@ impl<'v> Visitor<'v> for FindNestedReturn {
     }
 }
 
-fn build_cfg(tcx: &TyCtxt, id: ast::NodeId) -> (ast::NodeId, Option<cfg::CFG>) {
+fn build_cfg<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                       id: ast::NodeId)
+                       -> (ast::NodeId, Option<cfg::CFG>) {
     let blk = match tcx.map.find(id) {
         Some(hir_map::NodeItem(i)) => {
             match i.node {
@@ -1339,7 +1340,7 @@ fn build_cfg(tcx: &TyCtxt, id: ast::NodeId) -> (ast::NodeId, Option<cfg::CFG>) {
         }
         Some(hir_map::NodeExpr(e)) => {
             match e.node {
-                hir::ExprClosure(_, _, ref blk) => blk,
+                hir::ExprClosure(_, _, ref blk, _) => blk,
                 _ => bug!("unexpected expr variant in has_nested_returns"),
             }
         }
@@ -1366,7 +1367,7 @@ fn build_cfg(tcx: &TyCtxt, id: ast::NodeId) -> (ast::NodeId, Option<cfg::CFG>) {
 // part of a larger expression that may have already partially-filled the
 // return slot alloca. This can cause errors related to clean-up due to
 // the clobbering of the existing value in the return slot.
-fn has_nested_returns(tcx: &TyCtxt, cfg: &cfg::CFG, blk_id: ast::NodeId) -> bool {
+fn has_nested_returns(tcx: TyCtxt, cfg: &cfg::CFG, blk_id: ast::NodeId) -> bool {
     for index in cfg.graph.depth_traverse(cfg.entry) {
         let n = cfg.graph.node_data(index);
         match tcx.map.find(n.id()) {
@@ -1825,12 +1826,14 @@ pub fn trans_closure<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
                                closure_env: closure::ClosureEnv) {
     ccx.stats().n_closures.set(ccx.stats().n_closures.get() + 1);
 
-    if collector::collecting_debug_information(ccx) {
+    if collector::collecting_debug_information(ccx.shared()) {
         ccx.record_translation_item_as_generated(TransItem::Fn(instance));
     }
 
     let _icx = push_ctxt("trans_closure");
-    attributes::emit_uwtable(llfndecl, true);
+    if !ccx.sess().no_landing_pads() {
+        attributes::emit_uwtable(llfndecl, true);
+    }
 
     debug!("trans_closure(..., {})", instance);
 
@@ -1922,7 +1925,7 @@ pub fn trans_fn<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
     let fn_ty = ccx.tcx().lookup_item_type(def_id).ty;
     let fn_ty = monomorphize::apply_param_substs(ccx.tcx(), param_substs, &fn_ty);
     let sig = ccx.tcx().erase_late_bound_regions(fn_ty.fn_sig());
-    let sig = infer::normalize_associated_type(ccx.tcx(), &sig);
+    let sig = ccx.tcx().normalize_associated_type(&sig);
     let abi = fn_ty.fn_abi();
     trans_closure(ccx,
                   decl,
@@ -1946,7 +1949,7 @@ pub fn trans_named_tuple_constructor<'blk, 'tcx>(mut bcx: Block<'blk, 'tcx>,
     let ccx = bcx.fcx.ccx;
 
     let sig = ccx.tcx().erase_late_bound_regions(&ctor_ty.fn_sig());
-    let sig = infer::normalize_associated_type(ccx.tcx(), &sig);
+    let sig = ccx.tcx().normalize_associated_type(&sig);
     let result_ty = sig.output.unwrap();
 
     // Get location to store the result. If the user does not care about
@@ -2016,7 +2019,7 @@ pub fn trans_ctor_shim<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>,
     let ctor_ty = monomorphize::apply_param_substs(ccx.tcx(), param_substs, &ctor_ty);
 
     let sig = ccx.tcx().erase_late_bound_regions(&ctor_ty.fn_sig());
-    let sig = infer::normalize_associated_type(ccx.tcx(), &sig);
+    let sig = ccx.tcx().normalize_associated_type(&sig);
     let fn_ty = FnType::new(ccx, Abi::Rust, &sig, &[]);
 
     let (arena, fcx): (TypedArena<_>, FunctionContext);
@@ -2187,7 +2190,8 @@ pub fn update_linkage(ccx: &CrateContext,
             // `llval` is a translation of an item defined in a separate
             // compilation unit.  This only makes sense if there are at least
             // two compilation units.
-            assert!(ccx.sess().opts.cg.codegen_units > 1);
+            assert!(ccx.sess().opts.cg.codegen_units > 1 ||
+                    ccx.sess().opts.debugging_opts.incremental.is_some());
             // `llval` is a copy of something defined elsewhere, so use
             // `AvailableExternallyLinkage` to avoid duplicating code in the
             // output.
@@ -2523,7 +2527,7 @@ pub fn write_metadata<'a, 'tcx>(cx: &SharedCrateContext<'a, 'tcx>,
 
 /// Find any symbols that are defined in one compilation unit, but not declared
 /// in any other compilation unit.  Give these symbols internal linkage.
-fn internalize_symbols(cx: &SharedCrateContext, reachable: &HashSet<&str>) {
+fn internalize_symbols(cx: &CrateContextList, reachable: &HashSet<&str>) {
     unsafe {
         let mut declared = HashSet::new();
 
@@ -2578,12 +2582,12 @@ fn internalize_symbols(cx: &SharedCrateContext, reachable: &HashSet<&str>) {
 // when using MSVC linker.  We do this only for data, as linker can fix up
 // code references on its own.
 // See #26591, #27438
-fn create_imps(cx: &SharedCrateContext) {
+fn create_imps(cx: &CrateContextList) {
     // The x86 ABI seems to require that leading underscores are added to symbol
     // names, so we need an extra underscore on 32-bit. There's also a leading
     // '\x01' here which disables LLVM's symbol mangling (e.g. no extra
     // underscores added in front).
-    let prefix = if cx.sess().target.target.target_pointer_width == "32" {
+    let prefix = if cx.shared().sess().target.target.target_pointer_width == "32" {
         "\x01__imp__"
     } else {
         "\x01__imp_"
@@ -2660,10 +2664,10 @@ fn iter_functions(llmod: llvm::ModuleRef) -> ValueIter {
 ///
 /// This list is later used by linkers to determine the set of symbols needed to
 /// be exposed from a dynamic library and it's also encoded into the metadata.
-pub fn filter_reachable_ids(ccx: &SharedCrateContext) -> NodeSet {
-    ccx.reachable().iter().map(|x| *x).filter(|id| {
+pub fn filter_reachable_ids(scx: &SharedCrateContext) -> NodeSet {
+    scx.reachable().iter().map(|x| *x).filter(|id| {
         // First, only worry about nodes which have a symbol name
-        ccx.item_symbols().borrow().contains_key(id)
+        scx.item_symbols().borrow().contains_key(id)
     }).filter(|&id| {
         // Next, we want to ignore some FFI functions that are not exposed from
         // this crate. Reachable FFI functions can be lumped into two
@@ -2678,19 +2682,19 @@ pub fn filter_reachable_ids(ccx: &SharedCrateContext) -> NodeSet {
         //
         // As a result, if this id is an FFI item (foreign item) then we only
         // let it through if it's included statically.
-        match ccx.tcx().map.get(id) {
+        match scx.tcx().map.get(id) {
             hir_map::NodeForeignItem(..) => {
-                ccx.sess().cstore.is_statically_included_foreign_item(id)
+                scx.sess().cstore.is_statically_included_foreign_item(id)
             }
             _ => true,
         }
     }).collect()
 }
 
-pub fn trans_crate<'tcx>(tcx: &TyCtxt<'tcx>,
-                         mir_map: &MirMap<'tcx>,
-                         analysis: ty::CrateAnalysis)
-                         -> CrateTranslation {
+pub fn trans_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                             mir_map: &MirMap<'tcx>,
+                             analysis: ty::CrateAnalysis)
+                             -> CrateTranslation {
     let _task = tcx.dep_graph.in_task(DepNode::TransCrate);
 
     // Be careful with this krate: obviously it gives access to the
@@ -2713,12 +2717,9 @@ pub fn trans_crate<'tcx>(tcx: &TyCtxt<'tcx>,
         tcx.sess.opts.debug_assertions
     };
 
-    let link_meta = link::build_link_meta(&tcx, name);
+    let link_meta = link::build_link_meta(tcx, name);
 
-    let codegen_units = tcx.sess.opts.cg.codegen_units;
-    let shared_ccx = SharedCrateContext::new(&link_meta.crate_name,
-                                             codegen_units,
-                                             tcx,
+    let shared_ccx = SharedCrateContext::new(tcx,
                                              &mir_map,
                                              export_map,
                                              Sha256::new(),
@@ -2727,9 +2728,15 @@ pub fn trans_crate<'tcx>(tcx: &TyCtxt<'tcx>,
                                              check_overflow,
                                              check_dropflag);
 
+    let codegen_units = collect_and_partition_translation_items(&shared_ccx);
+    let codegen_unit_count = codegen_units.len();
+    assert!(tcx.sess.opts.cg.codegen_units == codegen_unit_count ||
+            tcx.sess.opts.debugging_opts.incremental.is_some());
+
+    let crate_context_list = CrateContextList::new(&shared_ccx, codegen_units);
+
     {
-        let ccx = shared_ccx.get_ccx(0);
-        collect_translation_items(&ccx);
+        let ccx = crate_context_list.get_ccx(0);
 
         // Translate all items. See `TransModVisitor` for
         // details on why we walk in this particular way.
@@ -2739,12 +2746,12 @@ pub fn trans_crate<'tcx>(tcx: &TyCtxt<'tcx>,
             krate.visit_all_items(&mut TransModVisitor { ccx: &ccx });
         }
 
-        collector::print_collection_results(&ccx);
+        collector::print_collection_results(ccx.shared());
 
         symbol_names_test::report_symbol_names(&ccx);
     }
 
-    for ccx in shared_ccx.iter() {
+    for ccx in crate_context_list.iter() {
         if ccx.sess().opts.debuginfo != NoDebugInfo {
             debuginfo::finalize(&ccx);
         }
@@ -2793,7 +2800,7 @@ pub fn trans_crate<'tcx>(tcx: &TyCtxt<'tcx>,
         }
     }
 
-    let modules = shared_ccx.iter()
+    let modules = crate_context_list.iter()
         .map(|ccx| ModuleTranslation { llcx: ccx.llcx(), llmod: ccx.llmod() })
         .collect();
 
@@ -2819,14 +2826,14 @@ pub fn trans_crate<'tcx>(tcx: &TyCtxt<'tcx>,
         }
     }
 
-    if codegen_units > 1 {
-        internalize_symbols(&shared_ccx,
+    if codegen_unit_count > 1 {
+        internalize_symbols(&crate_context_list,
                             &reachable_symbols.iter().map(|x| &x[..]).collect());
     }
 
     if sess.target.target.options.is_like_msvc &&
        sess.crate_types.borrow().iter().any(|ct| *ct == config::CrateTypeRlib) {
-        create_imps(&shared_ccx);
+        create_imps(&crate_context_list);
     }
 
     let metadata_module = ModuleTranslation {
@@ -2911,10 +2918,11 @@ impl<'a, 'tcx, 'v> Visitor<'v> for TransItemsWithinModVisitor<'a, 'tcx> {
     }
 }
 
-fn collect_translation_items<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>) {
-    let time_passes = ccx.sess().time_passes();
+fn collect_and_partition_translation_items<'a, 'tcx>(scx: &SharedCrateContext<'a, 'tcx>)
+                                                     -> Vec<CodegenUnit<'tcx>> {
+    let time_passes = scx.sess().time_passes();
 
-    let collection_mode = match ccx.sess().opts.debugging_opts.print_trans_items {
+    let collection_mode = match scx.sess().opts.debugging_opts.print_trans_items {
         Some(ref s) => {
             let mode_string = s.to_lowercase();
             let mode_string = mode_string.trim();
@@ -2925,7 +2933,7 @@ fn collect_translation_items<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>) {
                     let message = format!("Unknown codegen-item collection mode '{}'. \
                                            Falling back to 'lazy' mode.",
                                            mode_string);
-                    ccx.sess().warn(&message);
+                    scx.sess().warn(&message);
                 }
 
                 TransItemCollectionMode::Lazy
@@ -2935,18 +2943,27 @@ fn collect_translation_items<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>) {
     };
 
     let (items, inlining_map) = time(time_passes, "translation item collection", || {
-        collector::collect_crate_translation_items(&ccx, collection_mode)
+        collector::collect_crate_translation_items(&scx, collection_mode)
     });
+
+    let strategy = if scx.sess().opts.debugging_opts.incremental.is_some() {
+        PartitioningStrategy::PerModule
+    } else {
+        PartitioningStrategy::FixedUnitCount(scx.sess().opts.cg.codegen_units)
+    };
 
     let codegen_units = time(time_passes, "codegen unit partitioning", || {
-        partitioning::partition(ccx.tcx(), items.iter().cloned(), &inlining_map)
+        partitioning::partition(scx.tcx(),
+                                items.iter().cloned(),
+                                strategy,
+                                &inlining_map)
     });
 
-    if ccx.sess().opts.debugging_opts.print_trans_items.is_some() {
+    if scx.sess().opts.debugging_opts.print_trans_items.is_some() {
         let mut item_to_cgus = HashMap::new();
 
-        for cgu in codegen_units {
-            for (trans_item, linkage) in cgu.items {
+        for cgu in &codegen_units {
+            for (&trans_item, &linkage) in &cgu.items {
                 item_to_cgus.entry(trans_item)
                             .or_insert(Vec::new())
                             .push((cgu.name.clone(), linkage));
@@ -2956,7 +2973,7 @@ fn collect_translation_items<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>) {
         let mut item_keys: Vec<_> = items
             .iter()
             .map(|i| {
-                let mut output = i.to_string(ccx);
+                let mut output = i.to_string(scx.tcx());
                 output.push_str(" @@");
                 let mut empty = Vec::new();
                 let mut cgus = item_to_cgus.get_mut(i).unwrap_or(&mut empty);
@@ -2994,10 +3011,12 @@ fn collect_translation_items<'a, 'tcx>(ccx: &CrateContext<'a, 'tcx>) {
             println!("TRANS_ITEM {}", item);
         }
 
-        let mut ccx_map = ccx.translation_items().borrow_mut();
+        let mut ccx_map = scx.translation_items().borrow_mut();
 
         for cgi in items {
             ccx_map.insert(cgi, TransItemState::PredictedButNotGenerated);
         }
     }
+
+    codegen_units
 }

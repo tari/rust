@@ -25,13 +25,13 @@ macro_rules! write {
             write(stdout, $arr.as_ptr() as *const i8,
                   $arr.len() * size_of($arr[0]));
             //~^ ERROR mismatched types
+            //~| expected u64, found usize
         }
     }}
 }
 
 macro_rules! cast {
-    ($x:expr) => ($x as ())
-    //~^ ERROR non-scalar cast: `i32` as `()`
+    ($x:expr) => ($x as ()) //~ ERROR non-scalar cast
 }
 
 fn main() {
